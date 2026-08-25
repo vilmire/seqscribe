@@ -1,0 +1,387 @@
+{
+  "seqscribe": "vectors/v1",
+  "spec": "v3.2",
+  "generator": "tools/gen-vectors.mjs",
+  "note": "Sections 1-6 follow normative SPEC text; section 7 (topicSchemaHash) follows the PROPOSED normalization in docs/proposals-v3.3.md and is not yet ratified.",
+  "jcs": [
+    {
+      "name": "empty object",
+      "input": {},
+      "jcs": "{}"
+    },
+    {
+      "name": "empty array",
+      "input": [],
+      "jcs": "[]"
+    },
+    {
+      "name": "key sorting (UTF-16 code units)",
+      "input": {
+        "b": 2,
+        "a": 1,
+        "A": 0
+      },
+      "jcs": "{\"A\":0,\"a\":1,\"b\":2}"
+    },
+    {
+      "name": "unicode key sorts after ASCII",
+      "input": {
+        "é": 1,
+        "z": 2
+      },
+      "jcs": "{\"z\":2,\"é\":1}"
+    },
+    {
+      "name": "nested + null",
+      "input": {
+        "x": [
+          1,
+          null,
+          {
+            "y": false
+          }
+        ]
+      },
+      "jcs": "{\"x\":[1,null,{\"y\":false}]}"
+    },
+    {
+      "name": "integer",
+      "input": 42,
+      "jcs": "42"
+    },
+    {
+      "name": "negative zero",
+      "input": 0,
+      "jcs": "0"
+    },
+    {
+      "name": "fraction",
+      "input": 0.1,
+      "jcs": "0.1"
+    },
+    {
+      "name": "large exponent",
+      "input": 1e+21,
+      "jcs": "1e+21"
+    },
+    {
+      "name": "small exponent",
+      "input": 1e-7,
+      "jcs": "1e-7"
+    },
+    {
+      "name": "max safe integer",
+      "input": 9007199254740991,
+      "jcs": "9007199254740991"
+    },
+    {
+      "name": "string escapes",
+      "input": "a\"b\\c\nd\te\u0001f",
+      "jcs": "\"a\\\"b\\\\c\\nd\\te\\u0001f\""
+    },
+    {
+      "name": "unicode string (NFC as authored)",
+      "input": "héllo ✓",
+      "jcs": "\"héllo ✓\""
+    }
+  ],
+  "framing": [
+    {
+      "input": "seqscribe:v1",
+      "hex": "0000000c7365717363726962653a7631"
+    },
+    {
+      "input": "",
+      "hex": "00000000"
+    },
+    {
+      "input": "0",
+      "hex": "0000000130"
+    },
+    {
+      "input": "héllo",
+      "hex": "0000000668c3a96c6c6f"
+    }
+  ],
+  "seeds": [
+    {
+      "topic": "vec.notes",
+      "writer": "vec-w1",
+      "seed": "da3ea38e8ef04c74ae6c30bdc82b8c3d96c6b050b23180b8dd789a20f24d2403"
+    },
+    {
+      "topic": "vec.notes",
+      "writer": "vec-w2",
+      "seed": "ef93720b256875b9e1188e4c50bf3e511bc7804ee2857d7df3c126b4623d8ca6"
+    },
+    {
+      "topic": "mesh.ledger",
+      "writer": "adhdev:m1",
+      "seed": "f987714a9bf9f4f103fb0025b7adf8393a481196ed50f787be0df131ccdfa937"
+    },
+    {
+      "topic": "a",
+      "writer": "bc",
+      "seed": "53b399a0af727d5fc350da8984fefef118f2f4ece8a3e51a6f9d34c4273f898f"
+    },
+    {
+      "topic": "ab",
+      "writer": "c",
+      "seed": "feb265ed3c3247bad501df4dee89e226e77db89cb2dc465f856e4d305123fb6d"
+    }
+  ],
+  "chains": [
+    {
+      "entry": {
+        "topic": "vec.notes",
+        "writer": "vec-w1",
+        "seq": 1,
+        "hlc": {
+          "l": 1756166400000,
+          "c": 0
+        },
+        "kind": "note",
+        "payload": {
+          "text": "hello",
+          "n": 1
+        }
+      },
+      "prevChain": "da3ea38e8ef04c74ae6c30bdc82b8c3d96c6b050b23180b8dd789a20f24d2403",
+      "chain": "56c8f6e3284663affd3914087815d35355d09d6f97047969c1bec74e23f56562"
+    },
+    {
+      "entry": {
+        "topic": "vec.notes",
+        "writer": "vec-w1",
+        "seq": 2,
+        "hlc": {
+          "l": 1756166400000,
+          "c": 1
+        },
+        "kind": "note",
+        "payload": {
+          "z": 2,
+          "é": 1,
+          "big": 1e+21,
+          "frac": 0.1,
+          "text": "héllo ✓"
+        }
+      },
+      "prevChain": "56c8f6e3284663affd3914087815d35355d09d6f97047969c1bec74e23f56562",
+      "chain": "80a78bedae7f65763e2c1aaf987b9815bf4d18b05fab5ef15f53ea2e6cc19c5b"
+    },
+    {
+      "entry": {
+        "topic": "vec.notes",
+        "writer": "vec-w1",
+        "seq": 3,
+        "hlc": {
+          "l": 1756166400001,
+          "c": 0
+        },
+        "kind": "set",
+        "key": "config.theme",
+        "causal": [
+          "vec-w1",
+          2
+        ],
+        "payload": {
+          "value": "dark"
+        }
+      },
+      "prevChain": "80a78bedae7f65763e2c1aaf987b9815bf4d18b05fab5ef15f53ea2e6cc19c5b",
+      "chain": "28a6670987eedfab5826e7729bf3282c1d10d79ee245c8da91a990afa4c738b1"
+    },
+    {
+      "entry": {
+        "topic": "vec.notes",
+        "writer": "vec-w1",
+        "seq": 4,
+        "hlc": {
+          "l": 1756166400002,
+          "c": 0
+        },
+        "kind": "del",
+        "key": "config.theme",
+        "causal": [
+          "vec-w1",
+          3
+        ],
+        "payload": null
+      },
+      "prevChain": "28a6670987eedfab5826e7729bf3282c1d10d79ee245c8da91a990afa4c738b1",
+      "chain": "5ee66d2d0213362a6186caf6a6033f5bcf943aa76766fbbd065fc470860005c7"
+    },
+    {
+      "entry": {
+        "topic": "vec.notes",
+        "writer": "vec-w1",
+        "seq": 5,
+        "hlc": {
+          "l": 1756166400003,
+          "c": 0
+        },
+        "kind": "note",
+        "ref": [
+          "vec.notes",
+          "vec-w1",
+          1
+        ],
+        "payload": {
+          "reply": true
+        }
+      },
+      "prevChain": "5ee66d2d0213362a6186caf6a6033f5bcf943aa76766fbbd065fc470860005c7",
+      "chain": "c2f80571f7654870a22662f07431f80ff4b2e5e01765d9663130cbf3d7977c48"
+    }
+  ],
+  "certHash": {
+    "cert": {
+      "topic": "vec.notes",
+      "order": {
+        "l": 1756166400001,
+        "c": 0,
+        "writer": "vec-w1",
+        "seq": 3
+      },
+      "cut": {
+        "vec-w1": {
+          "seq": 3,
+          "chain": "28a6670987eedfab5826e7729bf3282c1d10d79ee245c8da91a990afa4c738b1"
+        }
+      },
+      "generation": 1,
+      "authority": "vec:authority",
+      "sig": "304502...deadbeef"
+    },
+    "jcs": "{\"authority\":\"vec:authority\",\"cut\":{\"vec-w1\":{\"chain\":\"28a6670987eedfab5826e7729bf3282c1d10d79ee245c8da91a990afa4c738b1\",\"seq\":3}},\"generation\":1,\"order\":{\"c\":0,\"l\":1756166400001,\"seq\":3,\"writer\":\"vec-w1\"},\"sig\":\"304502...deadbeef\",\"topic\":\"vec.notes\"}",
+    "certHash": "ab98dadf2c4e26814bbb1e5c372b8ba8d1de090448669cbc5d5a106e9c42cafc"
+  },
+  "snapshotId": {
+    "body": {
+      "topic": "vec.notes",
+      "order": {
+        "l": 1756166400001,
+        "c": 0,
+        "writer": "vec-w1",
+        "seq": 3
+      },
+      "generation": 1,
+      "certHash": "ab98dadf2c4e26814bbb1e5c372b8ba8d1de090448669cbc5d5a106e9c42cafc",
+      "cut": {
+        "vec-w1": {
+          "seq": 3,
+          "chain": "28a6670987eedfab5826e7729bf3282c1d10d79ee245c8da91a990afa4c738b1"
+        }
+      },
+      "directives": [],
+      "views": []
+    },
+    "jcs": "{\"certHash\":\"ab98dadf2c4e26814bbb1e5c372b8ba8d1de090448669cbc5d5a106e9c42cafc\",\"cut\":{\"vec-w1\":{\"chain\":\"28a6670987eedfab5826e7729bf3282c1d10d79ee245c8da91a990afa4c738b1\",\"seq\":3}},\"directives\":[],\"generation\":1,\"order\":{\"c\":0,\"l\":1756166400001,\"seq\":3,\"writer\":\"vec-w1\"},\"topic\":\"vec.notes\",\"views\":[]}",
+    "snapshotId": "370f65327c48f6c8d2f14feb6de7058f2fd7c49e831d78bc8be47e255471080f"
+  },
+  "topicSchemaHash": [
+    {
+      "name": "append/full, no authority",
+      "policy": {
+        "kind": "append",
+        "retention": {
+          "mode": "full"
+        },
+        "replication": "full-sync",
+        "access": "content"
+      },
+      "normalized": {
+        "kind": "append",
+        "conflict": null,
+        "registerSemanticsVersion": 1,
+        "finalityAuthority": null
+      },
+      "jcs": "{\"conflict\":null,\"finalityAuthority\":null,\"kind\":\"append\",\"registerSemanticsVersion\":1}",
+      "topicSchemaHash": "5e1e4b1608c931812bf3eb73c897ace617105c77ccc6e5eba6bce03de3f94bfd"
+    },
+    {
+      "name": "register, defaults omitted",
+      "policy": {
+        "kind": "register",
+        "retention": {
+          "mode": "full"
+        },
+        "replication": "full-sync",
+        "access": "content",
+        "finalityAuthority": "vec:authority"
+      },
+      "normalized": {
+        "kind": "register",
+        "conflict": {
+          "default": "lww",
+          "overrides": {}
+        },
+        "registerSemanticsVersion": 1,
+        "finalityAuthority": "vec:authority"
+      },
+      "jcs": "{\"conflict\":{\"default\":\"lww\",\"overrides\":{}},\"finalityAuthority\":\"vec:authority\",\"kind\":\"register\",\"registerSemanticsVersion\":1}",
+      "topicSchemaHash": "c7b17aafc430f6e54fb5503476fcc59fd0c4f379d11a7a5240a5013faf485e5d"
+    },
+    {
+      "name": "register, explicit lww (MUST hash identically to previous)",
+      "policy": {
+        "kind": "register",
+        "retention": {
+          "mode": "full"
+        },
+        "replication": "full-sync",
+        "access": "content",
+        "conflict": {
+          "default": "lww",
+          "overrides": {}
+        },
+        "finalityAuthority": "vec:authority"
+      },
+      "normalized": {
+        "kind": "register",
+        "conflict": {
+          "default": "lww",
+          "overrides": {}
+        },
+        "registerSemanticsVersion": 1,
+        "finalityAuthority": "vec:authority"
+      },
+      "jcs": "{\"conflict\":{\"default\":\"lww\",\"overrides\":{}},\"finalityAuthority\":\"vec:authority\",\"kind\":\"register\",\"registerSemanticsVersion\":1}",
+      "topicSchemaHash": "c7b17aafc430f6e54fb5503476fcc59fd0c4f379d11a7a5240a5013faf485e5d"
+    },
+    {
+      "name": "register with overrides",
+      "policy": {
+        "kind": "register",
+        "retention": {
+          "mode": "full"
+        },
+        "replication": "full-sync",
+        "access": "content",
+        "conflict": {
+          "default": "lww",
+          "overrides": {
+            "security.*": "fww",
+            "providers.pinned": "resolver"
+          }
+        },
+        "finalityAuthority": "vec:authority"
+      },
+      "normalized": {
+        "kind": "register",
+        "conflict": {
+          "default": "lww",
+          "overrides": {
+            "security.*": "fww",
+            "providers.pinned": "resolver"
+          }
+        },
+        "registerSemanticsVersion": 1,
+        "finalityAuthority": "vec:authority"
+      },
+      "jcs": "{\"conflict\":{\"default\":\"lww\",\"overrides\":{\"providers.pinned\":\"resolver\",\"security.*\":\"fww\"}},\"finalityAuthority\":\"vec:authority\",\"kind\":\"register\",\"registerSemanticsVersion\":1}",
+      "topicSchemaHash": "a6ef0d8bde47ba3a4efed346f903a504ccf64971e10a8a45c5fa5881ad39a430"
+    }
+  ]
+}
