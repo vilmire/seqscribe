@@ -201,6 +201,13 @@ const ALL_TYPES: ReadonlySet<string> = new Set([
 
 type Rec = Record<string, unknown>;
 
+// PROBE seqs bound (proposals-v3.5 P7): our emitter (sync.locateFork's
+// log-spaced sweep) stops at 32 probe points, and 32 points already span any
+// seq range (1 + 2^31 exceeds every safe contig). 64 = 2× headroom for a
+// second implementation's sweep; beyond that is per-frame work amplification
+// (each seq costs the responder a store lookup), not a conforming probe.
+const MAX_PROBE_SEQS = 64;
+
 function bad(t: string, why: string): never {
   throw new SeqscribeError("ERR_ENTRY_ENCODING", `${t}: ${why}`);
 }
@@ -337,6 +344,7 @@ function validateShape(m: Rec): void {
       vTopic(t, m.topic, "topic");
       vWriter(t, m.writer, "writer");
       const seqs = vArr(t, m.seqs, "seqs");
+      if (seqs.length > MAX_PROBE_SEQS) bad(t, `seqs exceeds ${MAX_PROBE_SEQS} probe points`);
       for (const s of seqs) vPos(t, s, "seqs[]");
       break;
     }

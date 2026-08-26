@@ -98,6 +98,7 @@ export interface Constants {
   MAX_ENTRY_BYTES: number;
   MAX_FRAME_BYTES: number;
   MAX_ROW_BYTES: number;
+  MAX_REASSEMBLY_BYTES: number;
   INFLIGHT_CREDITS: number;
   CHANNEL_STALL_MS: number;
   SEND_QUEUE_CAP: number;

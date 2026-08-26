@@ -123,6 +123,16 @@ describe("parseMsg round-trips every frame this implementation emits", () => {
   it("accepts SUB with absent params (JSON.stringify drops undefined)", () => {
     expect(() => parseMsg('{"t":"SUB","subId":1,"view":"v"}', C)).not.toThrow();
   });
+
+  it("accepts PROBE at the 64-seq bound (emitter stops at 32 — 2x headroom)", () => {
+    const m: WireMsg = {
+      t: "PROBE",
+      topic: T,
+      writer: "wA",
+      seqs: Array.from({ length: 64 }, (_, i) => i + 1),
+    };
+    expect(parseMsg(serializeMsg(m, C), C)).toEqual(m);
+  });
 });
 
 describe("parseMsg rejects malformed frames of every handled type", () => {
@@ -146,6 +156,10 @@ describe("parseMsg rejects malformed frames of every handled type", () => {
     ["ENTRIES entries not an array", `{"t":"ENTRIES","mid":1,"topic":"${T}","writer":"wA","fromSeq":1,"toSeq":1,"entries":{},"done":true}`],
     ["ENTRIES done not boolean", `{"t":"ENTRIES","mid":1,"topic":"${T}","writer":"wA","fromSeq":1,"toSeq":1,"entries":[],"done":"yes"}`],
     ["PROBE seq 0", `{"t":"PROBE","topic":"${T}","writer":"wA","seqs":[0]}`],
+    [
+      "PROBE seqs beyond the 64 cap",
+      `{"t":"PROBE","topic":"${T}","writer":"wA","seqs":[${Array.from({ length: 65 }, (_, i) => i + 1).join(",")}]}`,
+    ],
     ["PROBE_RES point without chain", `{"t":"PROBE_RES","topic":"${T}","writer":"wA","points":[{"seq":1}]}`],
     ["FINALITY null cert", `{"t":"FINALITY","topic":"${T}","cert":null}`],
     ["FINALITY cert without authority", `{"t":"FINALITY","topic":"${T}","cert":{"topic":"${T}","order":{},"cut":{},"generation":1,"sig":"s"}}`],
@@ -382,6 +396,128 @@ describe("hostile HAVE vectors", () => {
       expect(h.handle.state()).toBe("ready");
     }
     expect(({} as { contig?: unknown }).contig).toBeUndefined(); // Object.prototype untouched
+    h.close();
+  });
+});
+
+// ---- chunked reassembly total bound (MAX_REASSEMBLY_BYTES, proposals-v3.5 P7) ----
+//
+// Every frame is individually frame-capped, but SNAP/SNAPSHOT/HAVE `of` is
+// peer-chosen: without a total bound a hostile peer streams arbitrarily many
+// distinct in-range chunks into one reassembly map. Overflow is a protocol
+// violation → ERR + close, and the abandoned map must be freed.
+
+interface SyncInternals {
+  peers: Map<unknown, { havePages: Map<number, unknown>; haveBytes: number }>;
+  subHub: {
+    clientSubs: Map<string, { chunks: Map<number, string>; chunkBytes: number }>;
+  };
+  snapshotHub: { assemblies: Map<string, unknown>; requested: Set<string> };
+}
+
+function internals(h: Harness): SyncInternals {
+  return (h.node as unknown as { _sync: SyncInternals })._sync;
+}
+
+describe("chunked reassembly total bound (MAX_REASSEMBLY_BYTES)", () => {
+  it("legitimate multi-chunk SNAP under the cap still completes", () => {
+    const h = makeHarness({ MAX_REASSEMBLY_BYTES: 4_096 });
+    h.ready();
+    const sub = h.node.subscribe(h.handle, { view: "tail", params: { topic: T } });
+    let rows: unknown[] | null = null;
+    sub.onSnapshot((r) => (rows = r));
+    // ~2 KB body split like sendSnap does: raw slices at a 3-byte multiple so
+    // every chunk is independently valid base64
+    const body = new TextEncoder().encode(`[{"key":"k","pad":"${"x".repeat(2_000)}"}]`);
+    const cut = 1_200;
+    const chunks = [b64encode(body.subarray(0, cut)), b64encode(body.subarray(cut))];
+    for (const [i, data] of chunks.entries()) {
+      h.inject(
+        `{"t":"SNAP","mid":${i + 1},"subId":1,"chunk":${i + 1},"of":2,"data":"${data}","cursor":"cc","reset":true}`,
+      );
+    }
+    expect(h.handle.state()).toBe("ready");
+    expect(rows).not.toBeNull();
+    expect((rows as unknown as { key: string }[])[0]!.key).toBe("k");
+    h.close();
+  });
+
+  it("over-cap SNAP stream closes with ERR and frees the chunk map", () => {
+    const h = makeHarness({ MAX_REASSEMBLY_BYTES: 4_096 });
+    h.ready();
+    h.node.subscribe(h.handle, { view: "tail", params: { topic: T } });
+    const sub = internals(h).subHub.clientSubs.get("wPeer 1")!;
+    expect(sub).toBeDefined();
+    const data = "A".repeat(2_048);
+    const snap = (mid: number, chunk: number) =>
+      `{"t":"SNAP","mid":${mid},"subId":1,"chunk":${chunk},"of":1000,"data":"${data}","cursor":"cc","reset":true}`;
+    // retransmit of the same chunk (fresh mid — the server re-sends after a SUB
+    // retry) overwrites, it must not double-count toward the cap
+    h.inject(snap(1, 1));
+    h.inject(snap(2, 1));
+    expect(h.handle.state()).toBe("ready");
+    expect(sub.chunkBytes).toBe(2_048);
+    h.inject(snap(3, 2)); // 4 096 — at the cap, still allowed
+    expect(h.handle.state()).toBe("ready");
+    const before = h.sent.length;
+    expect(() => h.inject(snap(4, 3))).not.toThrow(); // 6 144 > 4 096 — over
+    expect(errsAfter(h, before).length).toBe(1);
+    expect(errsAfter(h, before)[0]!.code).toBe("ERR_ENTRY_ENCODING");
+    expect(h.handle.state()).toBe("closed");
+    // no residual memory: the map is dropped, and the closed session's client
+    // subs are pruned entirely
+    expect(sub.chunks.size).toBe(0);
+    expect(sub.chunkBytes).toBe(0);
+    expect(internals(h).subHub.clientSubs.size).toBe(0);
+    h.close();
+  });
+
+  it("over-cap HAVE pagination closes with ERR and frees the page map", () => {
+    const h = makeHarness({ MAX_REASSEMBLY_BYTES: 2_048 });
+    h.ready();
+    const req = (h.frames().find((f) => f.t === "HAVE_GET") as unknown as { req: number }).req;
+    const ps = [...internals(h).peers.values()][0]!;
+    const page = (n: number) => {
+      const writers: Record<string, unknown> = {};
+      for (let i = 0; i < 8; i++) writers[`w${n}x${i}`] = { contig: 1, chain: HEX64 };
+      return JSON.stringify({ t: "HAVE", req, page: n, of: 1000, vectors: { [T]: { writers } } });
+    };
+    // same page resent (control-lane retry) overwrites — no double-count
+    h.inject(page(1));
+    const afterFirst = ps.haveBytes;
+    h.inject(page(1));
+    expect(ps.haveBytes).toBe(afterFirst);
+    expect(h.handle.state()).toBe("ready");
+    const before = h.sent.length;
+    let n = 2;
+    while (h.handle.state() === "ready" && n < 50) h.inject(page(n++));
+    expect(h.handle.state()).toBe("closed");
+    expect(errsAfter(h, before).some((f) => f.code === "ERR_ENTRY_ENCODING")).toBe(true);
+    // no residual memory: page map freed, peer state dropped with the session
+    expect(ps.havePages.size).toBe(0);
+    expect(ps.haveBytes).toBe(0);
+    expect(internals(h).peers.size).toBe(0);
+    h.close();
+  });
+
+  it("over-cap SNAPSHOT stream closes with ERR and frees the assembly", () => {
+    const h = makeHarness({ MAX_REASSEMBLY_BYTES: 4_096 });
+    h.ready();
+    const data = "A".repeat(2_048);
+    const chunk = (mid: number, n: number) =>
+      `{"t":"SNAPSHOT","mid":${mid},"topic":"${T}","snapshotId":"${HEX64}","chunk":${n},"of":1000,"data":"${data}"}`;
+    h.inject(chunk(1, 1));
+    h.inject(chunk(2, 2)); // 4 096 — at the cap
+    expect(h.handle.state()).toBe("ready");
+    expect(internals(h).snapshotHub.assemblies.size).toBe(1);
+    const before = h.sent.length;
+    expect(() => h.inject(chunk(3, 3))).not.toThrow(); // 6 144 > 4 096 — over
+    expect(errsAfter(h, before).length).toBe(1);
+    expect(errsAfter(h, before)[0]!.code).toBe("ERR_ENTRY_ENCODING");
+    expect(h.handle.state()).toBe("closed");
+    // no residual memory, and the (content-derived) snapshotId is re-requestable
+    expect(internals(h).snapshotHub.assemblies.size).toBe(0);
+    expect(internals(h).snapshotHub.requested.has(HEX64)).toBe(false);
     h.close();
   });
 });

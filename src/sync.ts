@@ -41,7 +41,9 @@ import type {
   WriterId,
 } from "./types.js";
 
-const MAX_WANT_CONCURRENT = 4; // §6.2
+// §6.2 fixes "at most 4 concurrent WANTs per peer" in prose — spec-fixed, so a
+// module constant rather than a §16 tunable (hosts may not vary it).
+const MAX_WANT_CONCURRENT = 4;
 const ENTRIES_BATCH_MAX = 100;
 
 interface WantState {
@@ -58,6 +60,7 @@ interface PeerState {
   wantReq: number;
   expectedHaveReq: number | null;
   havePages: Map<number, MsgHave>;
+  haveBytes: number; // accumulated page payload — bounded by MAX_REASSEMBLY_BYTES
   captured: { req: number; pages: MsgHave[] } | null;
   activeWants: Map<number, WantState>;
   wantQueue: { topic: Topic; writer: WriterId }[];
@@ -192,6 +195,7 @@ export class SyncEngine {
       wantReq: 0,
       expectedHaveReq: null,
       havePages: new Map(),
+      haveBytes: 0,
       captured: null,
       activeWants: new Map(),
       wantQueue: [],
@@ -254,11 +258,33 @@ export class SyncEngine {
     const req = ++ps.haveReq;
     ps.expectedHaveReq = req;
     ps.havePages.clear();
+    ps.haveBytes = 0;
     ps.session.request(`HAVE:${req}`, (): MsgHaveGet => ({ t: "HAVE_GET", req }));
   }
 
   private onHavePage(ps: PeerState, m: MsgHave): void {
     if (m.req !== ps.expectedHaveReq) return; // stale round
+    // MAX_REASSEMBLY_BYTES (proposals-v3.5 P7): HAVE `of` is peer-chosen, so
+    // page indices in [1, of] (parseMsg) don't bound this map. Cost is the
+    // serialized page (what the map retains); delta-aware because control-lane
+    // retries legitimately resend the same page. Overflow is a protocol
+    // violation, not a big census: ERR + close, matching the §5.2 credit-window
+    // bound (the round restarts from scratch on redial).
+    const prev = ps.havePages.get(m.page);
+    ps.haveBytes +=
+      utf8ByteLength(JSON.stringify(m)) - (prev ? utf8ByteLength(JSON.stringify(prev)) : 0);
+    if (ps.haveBytes > this.o.constants.MAX_REASSEMBLY_BYTES) {
+      ps.havePages.clear();
+      ps.haveBytes = 0;
+      ps.expectedHaveReq = null;
+      ps.session.sendControl({
+        t: "ERR",
+        code: "ERR_ENTRY_ENCODING",
+        detail: `HAVE reassembly exceeds MAX_REASSEMBLY_BYTES (req ${m.req})`,
+      });
+      ps.session.close();
+      return;
+    }
     ps.havePages.set(m.page, m);
     if (ps.havePages.size < m.of) return;
     ps.session.satisfyRequest(`HAVE:${m.req}`);
@@ -272,6 +298,7 @@ export class SyncEngine {
       }
     }
     ps.havePages.clear();
+    ps.haveBytes = 0;
     this.processPeerVectors(ps, merged);
   }
 

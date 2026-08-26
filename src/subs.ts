@@ -107,6 +107,7 @@ interface ClientSub {
   params: JsonValue;
   chunks: Map<number, string>; // pending SNAP chunks
   chunksOf: number;
+  chunkBytes: number; // accumulated b64 payload — bounded by MAX_REASSEMBLY_BYTES
   chunkCursor: string;
   chunkReset: boolean;
   closed: boolean;
@@ -415,6 +416,7 @@ export class SubHub {
       params: o.params,
       chunks: new Map(),
       chunksOf: 0,
+      chunkBytes: 0,
       chunkCursor: "",
       chunkReset: false,
       closed: false,
@@ -461,9 +463,29 @@ export class SubHub {
     session.satisfyRequest(`SUB:${m.subId}`);
     if (m.of !== sub.chunksOf || m.cursor !== sub.chunkCursor) {
       sub.chunks.clear();
+      sub.chunkBytes = 0;
       sub.chunksOf = m.of;
       sub.chunkCursor = m.cursor;
       sub.chunkReset = m.reset;
+    }
+    // MAX_REASSEMBLY_BYTES (proposals-v3.5 P7): chunk indices sit in [1, of]
+    // (parseMsg) but `of` is peer-chosen, so per-frame caps alone leave this
+    // map unbounded. Delta-aware accounting — retransmits overwrite, they don't
+    // double-count. Overflow is a protocol violation, not congestion: same
+    // ERR + close discipline as the §5.2 credit-window bound (state resets on
+    // redial, so a buggy-but-honest peer recovers).
+    sub.chunkBytes += m.data.length - (sub.chunks.get(m.chunk)?.length ?? 0);
+    if (sub.chunkBytes > this.deps.constants.MAX_REASSEMBLY_BYTES) {
+      sub.chunks.clear();
+      sub.chunksOf = 0;
+      sub.chunkBytes = 0;
+      session.sendControl({
+        t: "ERR",
+        code: "ERR_ENTRY_ENCODING",
+        detail: `SNAP reassembly exceeds MAX_REASSEMBLY_BYTES (subId ${m.subId})`,
+      });
+      session.close();
+      return;
     }
     sub.chunks.set(m.chunk, m.data);
     if (sub.chunks.size < m.of) return;
@@ -477,6 +499,7 @@ export class SubHub {
     }
     sub.chunks.clear();
     sub.chunksOf = 0;
+    sub.chunkBytes = 0;
     // The reassembled body is peer-supplied: it must be a JCS row array (§5.4)
     // before it reaches subscriber callbacks. A bad body throws — the Session
     // dispatch guard turns that into ERR + drop instead of a host-visible crash.
