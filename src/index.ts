@@ -50,7 +50,7 @@ export { DirectiveHub } from "./directives.js";
 export { BeaconHub, httpBeaconTransport, beaconFetchHandler, type FetchRequestLike } from "./beacon.js";
 export { ArchiveHub } from "./archive.js";
 export { exportTopic, importTopic } from "./export.js";
-export { webSocketChannel, type WebSocketLike } from "./ws.js";
+export { webSocketChannel, dataChannelChannel, type WebSocketLike } from "./ws.js";
 export {
   betterSqlite3Handle,
   sqliteWasmHandle,

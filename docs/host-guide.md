@@ -13,7 +13,7 @@ Every obligation below remains yours, but the common shapes ship as helpers — 
 | `manageReconnect(node, {dial, peerId, peerClass, grants})` | §5.2's "host reconnects": jittered exponential backoff, reset on healthy sessions |
 | `loadOrCreateWriterId(storage, {prefix})` | stable per-machine id persisted in sq_meta (clone/restore procedures must delete the row — see §7) |
 | `migrateLegacyJsonl(node, topic, lines, {kind})` | genesis migration of pre-seqscribe JSONL logs as fresh appends |
-| `webSocketChannel(ws)` / `betterSqlite3Handle(db, lockDb?)` / `sqliteWasmHandle(db)` / `durableObjectSqlHandle(sql, txn)` | transport + storage adapters (Node, browser wasm, Durable Objects); `lockDb` enables the crash-safe cross-process owner lock |
+| `webSocketChannel(ws)` (= `dataChannelChannel`) / `betterSqlite3Handle(db, lockDb?)` / `sqliteWasmHandle(db)` / `durableObjectSqlHandle(sql, txn)` | transport + storage adapters — the socket channel accepts WebSocket, RTCDataChannel, and `isOpen()` wrappers (v3.5-P4); `lockDb` enables the crash-safe cross-process owner lock |
 | `httpBeaconTransport(base, account, token?)` / `beaconFetchHandler({token})` | the §14 beacon wire, client and Workers/DO-deployable server |
 | `node.stats()` | the §8 monitoring baseline below, one call |
 
@@ -24,7 +24,7 @@ Every obligation below remains yours, but the common shapes ship as helpers — 
 | **writerId issuance** | §1, §4.1 | Canonical, stable, ASCII-chartered ids. The host is the identity authority: never reuse an id across machines; never re-issue an id after quarantine/retirement (a returning id is recognized forever — §8 permanent registry). Machine clone/restore ⇒ new writerId, or you have manufactured a fork by construction (§6.4). |
 | **Connected, authenticated channels** | §5, `Channel` | The library sees only `send/onMessage/onClose`. Discovery, auth, NAT traversal, reconnect-with-backoff are yours. On stall-close (§5.2) the library closes; *you* reconnect. |
 | **Grants & peerClass per attach** | §4.1, §14 `attach` | **Granting `full` on a topic = trusting that peer to write arbitrary content under any writerId.** Entries are unsigned; grants are the only containment boundary. `metadata`-class peers (e.g. cloud relays) must never be granted content topics — the library throws, but the classification decision is yours. |
-| **Storage adapter + single-process ownership** | §8, `SqliteHandle` | Provide the adapter and honor the ownership lock. Two processes on one DB is corruption, not degraded mode. |
+| **Storage adapter + single-process ownership** | §8, `SqliteHandle` | Provide the adapter — **the library takes and releases the ownership lock itself** (`createSeqscribe` acquires, `node.close()` releases); do NOT call `acquireOwnerLock`/`releaseOwnerLock` yourself (a stray call is a harmless no-op since v3.5-P5, but it is never needed). Two processes on one DB is corruption, not degraded mode — catch `ERR_DB_OWNED` from `createSeqscribe` as the real-conflict signal. |
 | **Topic definitions before attach** | §14 | Policies are immutable per process; changing one is a fleet schema change (§6 below). |
 
 ## 2. Authority operations (the heaviest role)

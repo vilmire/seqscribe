@@ -43,8 +43,12 @@ export function betterSqlite3Handle(db: BetterSqlite3Like, lockDb?: LockDbLike):
     transaction(fn) {
       return db.transaction(fn)();
     },
+    // idempotent per handle (proposals-v3.5 P5): the library takes this lock
+    // in Store.init, and a host that also called it must not turn every
+    // successful open into a false "owned" error — real cross-process
+    // conflicts surface through the lock file, not the in-process flag
     acquireOwnerLock() {
-      if (owned) throw new Error("DB already owned by this process");
+      if (owned) return;
       if (lockDb) {
         try {
           lockDb.exec("BEGIN EXCLUSIVE");
@@ -117,9 +121,9 @@ export function sqliteWasmHandle(db: SqliteWasmDbLike): SqliteHandle {
       }
     },
     // browsers: one tab/worker owns the DB; OPFS sync access handles already
-    // enforce single-connection exclusivity at the file layer
+    // enforce single-connection exclusivity at the file layer. Idempotent per
+    // handle (P5).
     acquireOwnerLock() {
-      if (owned) throw new Error("DB already owned");
       owned = true;
     },
     releaseOwnerLock() {
@@ -179,8 +183,8 @@ export function durableObjectSqlHandle(
         depth--;
       }
     },
+    // a DO is single-threaded and owns its storage exclusively; idempotent (P5)
     acquireOwnerLock() {
-      if (owned) throw new Error("DB already owned");
       owned = true;
     },
     releaseOwnerLock() {
