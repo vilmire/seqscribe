@@ -11,6 +11,7 @@ import { misuse } from "./errors.js";
 import { exportTopic, importTopic } from "./export.js";
 import { FinalityHub } from "./finality.js";
 import { LogCore } from "./log.js";
+import { ArchiveHub } from "./archive.js";
 import { RegisterHub } from "./register.js";
 import { SnapshotHub } from "./snapshot.js";
 import { Store } from "./store.js";
@@ -102,8 +103,6 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNode {
     authority: opts.authority,
   });
   sync.setFinalityHub(finalityHub);
-  const subs = new SubHub({ views, core, topics, constants, timers, rng });
-  sync.setSubHub(subs);
   const registers = new RegisterHub({
     core,
     store,
@@ -115,6 +114,9 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNode {
     emitAnomaly,
     authority: opts.authority,
   });
+  const subs = new SubHub({ views, core, topics, constants, timers, rng, registers });
+  sync.setSubHub(subs);
+  registers.onChange((topic) => subs.handleRegisterChanged(topic));
   const directives = new DirectiveHub({
     core,
     store,
@@ -136,11 +138,14 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNode {
     authority: opts.authority,
   });
   sync.setSnapshotHub(snapshots);
+  const archive = new ArchiveHub({ core, store, topics, views, registers, constants, clock, emitAnomaly });
+  consumers.setOnAdvance((topic) => archive.onConsumerAdvance(topic));
   const beaconHub = new BeaconHub({ core, topics, writerId: opts.writerId, constants, timers, clock });
   finalityHub.setOnAccepted((cert) => {
     // §7.5c: certificate effects can rewrite covered history — recompute views
     views.notifyApplied(cert.topic);
     sync.onCertAccepted(); // unblocks §7.8-deferred WANTs
+    void archive.onCertAccepted(cert.topic); // §7.6: rebase + cold-archive
   });
 
   core.setOnApplied((e, rowid, via) => {
@@ -234,6 +239,7 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNode {
     _views: views,
     _registers: registers,
     _directives: directives,
+    _sync: sync,
   }) as SeqscribeNode;
 }
 

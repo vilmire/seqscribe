@@ -82,6 +82,7 @@ export interface RegisterHubDeps {
 
 export class RegisterHub {
   private readonly states = new Map<Topic, TopicState>();
+  private readonly changeListeners = new Set<(topic: Topic) => void>();
   private readonly conflictCbs = new Map<Topic, Set<(c: Conflict) => void | Promise<void>>>();
   private readonly requestCbs = new Map<
     Topic,
@@ -131,6 +132,21 @@ export class RegisterHub {
     };
   }
 
+  // fires after a materialize pass rewrote the built-in register table —
+  // subscription serving pushes SNAP resets from this (coarse but correct)
+  onChange(cb: (topic: Topic) => void): Unsub {
+    this.changeListeners.add(cb);
+    return () => this.changeListeners.delete(cb);
+  }
+
+  tableRowsSorted(topic: Topic): Record<string, string | number | null>[] {
+    return this.deps.store
+      .raw()
+      .all<Record<string, string | number | null>>(
+        `SELECT * FROM "${this.tableName(topic)}" ORDER BY key`,
+      );
+  }
+
   onConflict(topic: Topic, cb: (c: Conflict) => void | Promise<void>): Unsub {
     const set = this.conflictCbs.get(topic) ?? new Set();
     set.add(cb);
@@ -166,10 +182,17 @@ export class RegisterHub {
     return this.snapshotOf(this.topicState(topic));
   }
 
-  // register state exactly at `ord` — a fresh fold bounded by the cut (§7.7)
+  // register state exactly at `ord` — a fold bounded by the cut, starting from
+  // the base floor when one exists (pre-base rows may be archived) (§7.7)
   async stateAt(topic: Topic, ord: Order): Promise<RegisterSnapshotState> {
+    const live = this.topicState(topic);
     const st: TopicState = { keys: new Map(), ord: null, lastRowid: 0 };
     let cursor: Order | null = null;
+    if (live.base && orderCompare(live.base.ord, ord) <= 0) {
+      st.keys = this.cloneKeys(live.base.keys);
+      st.ord = live.base.ord;
+      cursor = live.base.ord;
+    }
     outer: for (;;) {
       const entries = this.deps.store.entriesAfterOrder(topic, cursor, 500);
       if (entries.length === 0) break;
@@ -190,6 +213,7 @@ export class RegisterHub {
     st.ord = ord;
     st.lastRowid = this.deps.store.maxRowid(topic);
     st.base = { keys: this.keysFromSnapshot(snap), ord };
+    this.deps.store.metaSet(`regbase:${topic}`, JSON.stringify({ snap, ord }));
     this.rewriteTable(topic, st);
   }
 
@@ -329,9 +353,27 @@ export class RegisterHub {
     let st = this.states.get(topic);
     if (!st) {
       st = { keys: new Map(), ord: null, lastRowid: 0 };
+      // restore the persisted base floor (survives restarts + archiving, §7.6)
+      const raw = this.deps.store.metaGet(`regbase:${topic}`);
+      if (raw) {
+        const saved = JSON.parse(raw) as { snap: RegisterSnapshotState; ord: Order };
+        st.base = { keys: this.keysFromSnapshot(saved.snap), ord: saved.ord };
+        st.keys = this.keysFromSnapshot(saved.snap);
+        st.ord = saved.ord;
+      }
       this.states.set(topic, st);
     }
     return st;
+  }
+
+  // §7.6: the cut state becomes the permanent fold floor — refolds start here,
+  // which keeps register materialization correct after pre-cut rows archive
+  async rebaseAtCut(topic: Topic, ord: Order): Promise<void> {
+    if (this.deps.topics.get(topic).policy.kind !== "register") return;
+    const snap = await this.stateAt(topic, ord);
+    const st = this.topicState(topic);
+    st.base = { keys: this.keysFromSnapshot(snap), ord };
+    this.deps.store.metaSet(`regbase:${topic}`, JSON.stringify({ snap, ord }));
   }
 
   private async materialize(topic: Topic): Promise<void> {
@@ -374,6 +416,7 @@ export class RegisterHub {
       }
       this.rewriteTable(topic, st);
       for (const fn of events) await fn();
+      for (const cb of this.changeListeners) cb(topic);
     } finally {
       this.materializing.delete(topic);
     }

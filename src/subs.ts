@@ -6,6 +6,7 @@
 import { jcs, utf8ByteLength } from "./encoding.js";
 import { misuse, SeqscribeError } from "./errors.js";
 import type { LogCore } from "./log.js";
+import type { RegisterHub } from "./register.js";
 import type { MsgDelta, MsgSnap, MsgSub, MsgSubErr, MsgUnsub } from "./messages.js";
 import type { Session } from "./session.js";
 import type { TopicRegistry } from "./topics.js";
@@ -118,6 +119,7 @@ export interface SubHubDeps {
   constants: Constants;
   timers: Timers;
   rng: () => number;
+  registers?: RegisterHub | undefined;
 }
 
 export class SubHub {
@@ -194,6 +196,22 @@ export class SubHub {
     }
   }
 
+  // register materialization rewrote the built-in table — SNAP-reset the group
+  handleRegisterChanged(topic: Topic): void {
+    const group = this.groups.get(this.registerKey(topic));
+    if (!group) return;
+    group.epoch = this.mintEpoch();
+    group.deltaSeq = 0;
+    group.journal = [];
+    for (const [session, subIds] of group.subs) {
+      for (const subId of subIds) this.sendSnap(group, session, subId, true);
+    }
+  }
+
+  private registerKey(topic: Topic): string {
+    return `register\u0000${jcs({ topic })}`;
+  }
+
   // ring topic entries feed their topic's tail groups (rowid-null applies)
   handleRingApplied(e: LogEntry): void {
     const group = this.groups.get(this.ringKey(e.topic));
@@ -208,6 +226,28 @@ export class SubHub {
     const key = `${view}\u0000${jcs(params ?? null)}`;
     const existing = this.groups.get(key);
     if (existing) return existing;
+
+    // built-in register table: view "register", params {topic} — SNAP-only (§9)
+    if (view === "register") {
+      const topic = (params as { topic?: string } | null)?.topic;
+      if (typeof topic !== "string")
+        throw new SeqscribeError("ERR_UNKNOWN_VIEW", "register needs {topic}");
+      if (this.deps.topics.get(topic).policy.kind !== "register" || !this.deps.registers)
+        throw new SeqscribeError("ERR_UNKNOWN_VIEW", `not a register topic (${topic})`);
+      const registers = this.deps.registers;
+      const group: Group = {
+        key: this.registerKey(topic),
+        viewName: null,
+        ringTopic: topic, // reuses the ring slot: "the topic this group serves"
+        epoch: this.mintEpoch(),
+        deltaSeq: 0,
+        journal: [],
+        subs: new Map(),
+        rowsProvider: () => registers.tableRowsSorted(topic) as Row[],
+      };
+      this.groups.set(group.key, group);
+      return group;
+    }
 
     // built-in ring tail: view "tail", params {topic}
     if (view === "tail") {

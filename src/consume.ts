@@ -25,6 +25,7 @@ interface Consumer {
 
 export class ConsumerHub {
   private readonly consumers = new Map<string, Consumer>();
+  private onAdvance: ((topic: Topic) => void) | null = null;
 
   constructor(
     private readonly deps: {
@@ -36,12 +37,21 @@ export class ConsumerHub {
     },
   ) {}
 
+  // archiving hook: fires after a drain pass advanced a cursor (§7.6)
+  setOnAdvance(fn: (topic: Topic) => void): void {
+    this.onAdvance = fn;
+  }
+
   onEntry(topic: Topic, name: string, cb: (e: LogEntry) => void | Promise<void>): Unsub {
     const policy = this.deps.topics.get(topic).policy;
     if (policy.retention.mode !== "full")
       throw misuse(`onEntry requires retention "full" (${topic}) — ring/none serve via SUB`);
     const key = `${topic} ${name}`;
     if (this.consumers.has(key)) throw misuse(`consumer already registered: ${key}`);
+    // a registered consumer gates archiving from the moment it registers (§7.6)
+    // — materialize its cursor row even before the first delivery succeeds
+    if (this.deps.store.cursorsForTopic(topic).every((c) => c.consumer !== name))
+      this.deps.store.cursorSet(name, topic, 0, new Date(this.deps.clock()).toISOString());
     const c: Consumer = {
       topic,
       name,
@@ -83,6 +93,15 @@ export class ConsumerHub {
   }
 
   private async drain(c: Consumer): Promise<void> {
+    let advanced = false;
+    try {
+      await this.drainInner(c, () => (advanced = true));
+    } finally {
+      if (advanced) this.onAdvance?.(c.topic);
+    }
+  }
+
+  private async drainInner(c: Consumer, onProgress: () => void): Promise<void> {
     for (;;) {
       if (c.gone) return;
       const cursor = this.deps.store.cursorGet(c.name, c.topic);
@@ -93,7 +112,15 @@ export class ConsumerHub {
         try {
           await c.cb(entry);
         } catch {
-          // no advance; retry with backoff (§9)
+          // no advance; retry with backoff (§9). Touch the timestamp so an
+          // actively-retrying consumer is not "idle" for §7.6 abandonment —
+          // only a consumer whose process is gone ages out.
+          this.deps.store.cursorSet(
+            c.name,
+            c.topic,
+            this.deps.store.cursorGet(c.name, c.topic),
+            new Date(this.deps.clock()).toISOString(),
+          );
           c.failures++;
           const delay = Math.min(BACKOFF_BASE_MS * 2 ** (c.failures - 1), BACKOFF_MAX_MS);
           c.retryTimer = this.deps.timers.setTimeout(() => {
@@ -109,6 +136,7 @@ export class ConsumerHub {
           rowid,
           new Date(this.deps.clock()).toISOString(),
         );
+        onProgress();
       }
     }
   }

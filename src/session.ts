@@ -34,6 +34,7 @@ export interface SessionOpts {
   onClose: (s: Session) => void;
   onControl: (s: Session, m: ControlMsg) => void;
   onData: (s: Session, m: DataMsg) => void;
+  onCapacity?: ((s: Session) => void) | undefined; // data queue drained below cap
 }
 
 interface PendingRequest {
@@ -56,8 +57,9 @@ export class Session {
 
   // data lane — sender
   private nextMid = 1;
-  private readonly unacked: { mid: number; at: number }[] = [];
+  private readonly unacked: { mid: number; at: number; frame: string; sentAt: number }[] = [];
   private readonly outQueue: ((mid: number) => DataMsg)[] = [];
+  private retryTimer: unknown = null;
   // data lane — receiver
   private recvContigMid = 0;
   private readonly recvBuffer = new Map<number, DataMsg>();
@@ -166,6 +168,10 @@ export class Session {
     return true;
   }
 
+  hasSendCapacity(): boolean {
+    return this.stateNow === "ready" && this.outQueue.length < this.c.SEND_QUEUE_CAP;
+  }
+
   private pumpData(): void {
     while (
       this.stateNow !== "closed" &&
@@ -175,10 +181,37 @@ export class Session {
       const make = this.outQueue.shift();
       if (!make) return;
       const mid = this.nextMid++;
-      const msg = make(mid);
-      this.unacked.push({ mid, at: this.o.clock() });
-      this.o.channel.send(serializeMsg(msg, this.c));
+      const frame = serializeMsg(make(mid), this.c);
+      this.unacked.push({ mid, at: this.o.clock(), frame, sentAt: this.o.clock() });
+      this.o.channel.send(frame);
     }
+    if (this.unacked.length > 0 && this.retryTimer === null) {
+      this.retryTimer = this.o.timers.setTimeout(
+        () => this.retryUnacked(),
+        this.c.CONTROL_RETRY_MS,
+      );
+    }
+  }
+
+  // Data-lane ARQ (proposals-v3.4 P2): a lost frame otherwise head-of-line
+  // blocks the mid-contiguous receiver until the CHANNEL_STALL_MS close —
+  // retransmitting unACKed frames (same mid) bounds loss recovery to the retry
+  // cadence instead. Receivers dedupe by mid, so retransmits are harmless.
+  private retryUnacked(): void {
+    this.retryTimer = null;
+    if (this.stateNow === "closed") return;
+    const now = this.o.clock();
+    for (const u of this.unacked) {
+      if (now - u.sentAt >= this.c.CONTROL_RETRY_MS) {
+        u.sentAt = now;
+        this.o.channel.send(u.frame);
+      }
+    }
+    if (this.unacked.length > 0)
+      this.retryTimer = this.o.timers.setTimeout(
+        () => this.retryUnacked(),
+        this.c.CONTROL_RETRY_MS,
+      );
   }
 
   private stallCheck(): void {
@@ -202,6 +235,7 @@ export class Session {
     for (const key of [...this.requests.keys()]) this.cancelRequest(key);
     if (this.helloTimer !== null) this.o.timers.clearTimeout(this.helloTimer);
     if (this.stallTimer !== null) this.o.timers.clearTimeout(this.stallTimer);
+    if (this.retryTimer !== null) this.o.timers.clearTimeout(this.retryTimer);
     this.o.channel.close();
     for (const cb of this.stateListeners) cb("closed");
     this.o.onClose(this);
@@ -237,6 +271,7 @@ export class Session {
       while (i < this.unacked.length && this.unacked[i]!.mid <= m.upTo) i++;
       this.unacked.splice(0, i);
       this.pumpData();
+      if (this.hasSendCapacity()) this.o.onCapacity?.(this);
       return;
     }
     if (DATA_TYPES.has(m.t)) {

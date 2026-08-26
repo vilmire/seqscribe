@@ -4,7 +4,7 @@
 
 **Subscribe to sequences** — writer-owned append-only log sync for SQLite, over any network you bring Logs converge into SQLite views. Embeddable, transport-agnostic (bring your own channel — WebRTC DataChannel, WebSocket, anything bidirectional), no consensus, no master, partition-tolerant by construction.
 
-**Status: implementation underway** (SPEC v3.3, 2026-08-26). The full design contract preceded implementation; the core paths of all five milestones now pass the scaled acceptance properties (P1/P2/P3/P5) under the deterministic harness — see [docs/implementation.md](docs/implementation.md) for exact coverage and remaining gaps. Not yet released; public release follows ADHDev production validation.
+**Status: implementation underway** (SPEC v3.3 + [v3.4 proposals](docs/proposals-v3.4.md), 2026-08-26). All five milestones implemented; the deterministic harness passes the scaled acceptance properties (P1/P2/P3/P5) **and the full §19 P7 catch-up gate** (100 nodes, 60 s partition, 1% loss → converged at heal+40 s). The P7 run surfaced four spec defects — evidence and amendment text in [docs/proposals-v3.4.md](docs/proposals-v3.4.md). See [docs/implementation.md](docs/implementation.md) for exact coverage. Not yet released; public release follows ADHDev production validation.
 
 The design contract:
 

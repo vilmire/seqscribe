@@ -48,5 +48,6 @@ export { SnapshotHub } from "./snapshot.js";
 export { RegisterHub } from "./register.js";
 export { DirectiveHub } from "./directives.js";
 export { BeaconHub } from "./beacon.js";
+export { ArchiveHub } from "./archive.js";
 export { exportTopic, importTopic } from "./export.js";
 export { createSeqscribe, coreOf } from "./node.js";

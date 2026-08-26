@@ -65,6 +65,13 @@ interface PeerState {
   recoveryProgress: Map<string, number>;
   antiEntropyTimer: unknown;
   probes: Map<string, (res: MsgProbeRes) => void>;
+  // last-known peer stream heads (from HAVE rounds, received ENTRIES, and our
+  // accepted pushes) — the targeting basis for knowledge-based push
+  known: Map<string, Seq>;
+  // streams where our contig may exceed the peer's known head; drained by a
+  // capacity-aware pump into batched ENTRIES pushes
+  dirty: Map<string, { topic: Topic; writer: WriterId; readyAt: number }>;
+  pumpTimer: unknown;
 }
 
 export interface SyncEngineOpts {
@@ -173,6 +180,10 @@ export class SyncEngine {
       onClose: (s) => this.onClosed(s),
       onControl: (s, m) => this.onControl(s, m),
       onData: (s, m) => this.onData(s, m),
+      onCapacity: (s) => {
+        const ps2 = this.peers.get(s);
+        if (ps2) this.pumpDirty(ps2);
+      },
     });
     const ps: PeerState = {
       session,
@@ -188,6 +199,9 @@ export class SyncEngine {
       recoveryProgress: new Map(),
       antiEntropyTimer: null,
       probes: new Map(),
+      known: new Map(),
+      dirty: new Map(),
+      pumpTimer: null,
     };
     this.peers.set(session, ps);
     return {
@@ -220,6 +234,7 @@ export class SyncEngine {
   private onClosed(s: Session): void {
     const ps = this.peers.get(s);
     if (ps?.antiEntropyTimer != null) this.o.timers.clearTimeout(ps.antiEntropyTimer);
+    if (ps?.pumpTimer != null) this.o.timers.clearTimeout(ps.pumpTimer);
     this.subHub?.handleSessionClosed(s);
     this.peers.delete(s);
   }
@@ -264,6 +279,8 @@ export class SyncEngine {
       if (!myCert && (v.fgen ?? 0) > 0) continue;
       for (const [writer, w] of Object.entries(v.writers)) {
         const head = this.o.core.getStream(topic, writer);
+        // authoritative knowledge refresh from the peer's own HAVE
+        ps.known.set(`${topic}\u0000${writer}`, "retired" in w ? w.finalSeq : w.contig);
         const peerRgen = w.rgen ?? 0;
         // rgen lag rule (§13): a peer advertising a lower rgen gets the latest directive
         if (peerRgen < head.rgen && this.directiveHub) {
@@ -295,8 +312,83 @@ export class SyncEngine {
           }
         }
         if (w.contig > head.contigSeq) this.queueWant(ps, topic, writer);
+        else if (w.contig < head.contigSeq) this.markDirty(ps, topic, writer, 0);
       }
     }
+  }
+
+  // ---- knowledge-based push (catch-up gossip) ----
+
+  private markDirty(ps: PeerState, topic: Topic, writer: WriterId, delayMs: number): void {
+    if (ps.session.state() !== "ready" || !ps.session.mutualFull(topic)) return;
+    const key = `${topic}\u0000${writer}`;
+    const readyAt = this.o.clock() + delayMs;
+    const existing = ps.dirty.get(key);
+    if (existing) existing.readyAt = Math.min(existing.readyAt, readyAt);
+    else ps.dirty.set(key, { topic, writer, readyAt });
+    this.schedulePump(ps, delayMs);
+  }
+
+  private schedulePump(ps: PeerState, delayMs: number): void {
+    if (ps.pumpTimer !== null) return;
+    ps.pumpTimer = this.o.timers.setTimeout(() => {
+      ps.pumpTimer = null;
+      this.pumpDirty(ps);
+    }, delayMs);
+  }
+
+  private pumpDirty(ps: PeerState): void {
+    if (ps.session.state() !== "ready") return;
+    const now = this.o.clock();
+    let earliestFuture: number | null = null;
+    for (const [key, d] of [...ps.dirty]) {
+      if (d.readyAt > now) {
+        earliestFuture = earliestFuture === null ? d.readyAt : Math.min(earliestFuture, d.readyAt);
+        continue;
+      }
+      if (!ps.session.hasSendCapacity()) return; // resume on onCapacity
+      const head = this.o.core.getStream(d.topic, d.writer);
+      const known = ps.known.get(key) ?? 0;
+      if (known >= head.contigSeq) {
+        ps.dirty.delete(key);
+        continue;
+      }
+      const budget = Math.floor(this.o.constants.MAX_FRAME_BYTES / 2);
+      const rows = this.o.store.entriesRange(
+        d.topic,
+        d.writer,
+        known + 1,
+        Math.min(head.contigSeq, known + ENTRIES_BATCH_MAX),
+      );
+      if (rows.length === 0) {
+        ps.dirty.delete(key); // below local retention — the peer bootstraps via snapshot
+        continue;
+      }
+      const batch: LogEntry[] = [];
+      let bytes = 0;
+      for (const { entry } of rows) {
+        const cost = utf8ByteLength(JSON.stringify(entry));
+        if (batch.length > 0 && bytes + cost > budget) break;
+        batch.push(entry);
+        bytes += cost;
+      }
+      const last = batch[batch.length - 1]!;
+      const done = last.seq >= head.contigSeq;
+      const accepted = ps.session.sendData((mid) => ({
+        t: "ENTRIES",
+        mid,
+        topic: d.topic,
+        writer: d.writer,
+        fromSeq: batch[0]!.seq,
+        toSeq: head.contigSeq,
+        entries: batch,
+        done,
+      }));
+      if (!accepted) return; // queue full — keep dirty, resume on onCapacity
+      ps.known.set(key, last.seq); // optimistic; the next HAVE round is authoritative
+      if (done) ps.dirty.delete(key);
+    }
+    if (earliestFuture !== null) this.schedulePump(ps, Math.max(0, earliestFuture - now));
   }
 
   // ---- WANT (requester side) ----
@@ -320,14 +412,24 @@ export class SyncEngine {
         continue;
       }
       const req = ++ps.wantReq;
+      // §12 steps 1–2: PROBE evidence bounds the re-verification window; without
+      // it the canonical prefix re-verifies from the start (mismatching local
+      // rows quarantine at the first divergence either way)
+      let recoveryFrom = 1;
+      if (recovery) {
+        const ev = this.o.store.metaGet(
+          `fork_evidence:${next.topic}:${next.writer}:${ps.session.peerId}`,
+        );
+        if (ev) {
+          const { lastCommon } = JSON.parse(ev) as { lastCommon: number };
+          if (Number.isSafeInteger(lastCommon) && lastCommon > 0) recoveryFrom = lastCommon + 1;
+        }
+      }
       const want: WantState = {
         req,
         topic: next.topic,
         writer: next.writer,
-        // recovery re-verifies the canonical prefix from the start; entries whose
-        // chains match locally come back as cheap duplicates, and the first
-        // mismatch is exactly the divergence point (§12 steps 1–2)
-        fromSeq: recovery ? 1 : head.contigSeq + 1,
+        fromSeq: recovery ? recoveryFrom : head.contigSeq + 1,
       };
       ps.activeWants.set(req, want);
       ps.session.request(
@@ -543,6 +645,8 @@ export class SyncEngine {
 
   private onEntries(ps: PeerState, m: MsgEntries): void {
     if (!ps.session.mutualFull(m.topic)) return; // ACL re-verified on receive (§5.4)
+    const key = `${m.topic}\u0000${m.writer}`;
+    if ((ps.known.get(key) ?? 0) < m.toSeq) ps.known.set(key, m.toSeq); // the sender holds ≥ toSeq
     const applies: Promise<unknown>[] = [];
     for (const raw of m.entries) {
       let entry: LogEntry;
@@ -586,46 +690,37 @@ export class SyncEngine {
     });
   }
 
-  // ---- eager push & relay (§6.3) ----
+  // ---- eager push & knowledge-based relay (§6.3, extended per proposals-v3.4 P1) ----
+  //
+  // Own appends push to the K most-recently-active peers (spec §6.3). External
+  // applies mark ALL other mutual-full peers dirty and let knowledge targeting
+  // suppress sends the peer doesn't need — replacing the hlc-window relay,
+  // whose recency criterion cannot gossip partition-aged backlogs (the P7
+  // finding: repair degenerated to one hop per anti-entropy round).
 
   handleApplied(e: LogEntry, via: string | undefined): void {
     const own = via === undefined && e.writer === this.o.writerId;
     if (own) {
-      this.pushToPeers(e, this.o.constants.EAGER_PUSH_K, undefined);
+      const throttle = this.o.topics.get(e.topic).policy.flushThrottleMs ?? 0;
+      const candidates = [...this.peers.values()]
+        .filter(
+          (ps) => ps.session.state() === "ready" && ps.session.mutualFull(e.topic),
+        )
+        .sort((a, b) =>
+          b.lastActivity !== a.lastActivity
+            ? b.lastActivity - a.lastActivity
+            : a.session.peerId < b.session.peerId
+              ? -1
+              : 1,
+        )
+        .slice(0, this.o.constants.EAGER_PUSH_K);
+      for (const ps of candidates) this.markDirty(ps, e.topic, e.writer, throttle);
       return;
     }
-    if (via !== undefined && e.hlc.l >= this.o.clock() - this.o.constants.RELAY_WINDOW_MS) {
-      this.pushToPeers(e, this.o.constants.RELAY_FANOUT, via);
-    }
-  }
-
-  private pushToPeers(e: LogEntry, k: number, exclude: string | undefined): void {
-    const candidates = [...this.peers.values()]
-      .filter(
-        (ps) =>
-          ps.session.state() === "ready" &&
-          ps.session.peerId !== exclude &&
-          ps.session.mutualFull(e.topic),
-      )
-      .sort((a, b) =>
-        b.lastActivity !== a.lastActivity
-          ? b.lastActivity - a.lastActivity
-          : a.session.peerId < b.session.peerId
-            ? -1
-            : 1,
-      )
-      .slice(0, k);
-    for (const ps of candidates) {
-      ps.session.sendData((mid) => ({
-        t: "ENTRIES",
-        mid,
-        topic: e.topic,
-        writer: e.writer,
-        fromSeq: e.seq,
-        toSeq: e.seq,
-        entries: [e],
-        done: true,
-      }));
+    if (via === undefined) return; // import/local replay: HAVE rounds cover it
+    for (const ps of this.peers.values()) {
+      if (ps.session.peerId === via) continue;
+      this.markDirty(ps, e.topic, e.writer, 0);
     }
   }
 

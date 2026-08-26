@@ -7,7 +7,7 @@ import type { JsonValue, LogEntry, Order, Seq, SqliteHandle, Topic, WriterId } f
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS sq_log (
-  rowid INTEGER PRIMARY KEY,
+  rowid INTEGER PRIMARY KEY AUTOINCREMENT,
   topic TEXT NOT NULL, writer TEXT NOT NULL, seq INTEGER NOT NULL,
   hlc_l INTEGER NOT NULL, hlc_c INTEGER NOT NULL,
   kind TEXT NOT NULL, key TEXT,
@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS sq_finality   (topic TEXT PRIMARY KEY, cert TEXT NOT 
 CREATE TABLE IF NOT EXISTS sq_directives (topic TEXT, writer TEXT, rgen INTEGER, directive TEXT NOT NULL,
   PRIMARY KEY (topic, writer, rgen));
 CREATE TABLE IF NOT EXISTS sq_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sq_archive (
+  topic TEXT NOT NULL, writer TEXT NOT NULL, seq INTEGER NOT NULL,
+  entry TEXT NOT NULL, archived_at TEXT NOT NULL,
+  PRIMARY KEY (topic, writer, seq));
 `;
 
 export type SealReason = "fork" | "retired" | null;
@@ -415,6 +419,99 @@ export class Store {
       view,
       version,
     ]);
+  }
+
+  cursorsForTopic(topic: Topic): { consumer: string; lastRowid: number; updatedAt: string }[] {
+    return this.db
+      .all<{ consumer: string; last_rowid: number; updated_at: string }>(
+        "SELECT consumer, last_rowid, updated_at FROM sq_cursors WHERE topic = ?",
+        [topic],
+      )
+      .map((r) => ({ consumer: r.consumer, lastRowid: r.last_rowid, updatedAt: r.updated_at }));
+  }
+
+  cursorDelete(consumer: string, topic: Topic): void {
+    this.db.run("DELETE FROM sq_cursors WHERE consumer = ? AND topic = ?", [consumer, topic]);
+  }
+
+  // §7.6 cold archiving: move canonical covered rows out of the hot log.
+  // Bounded by maxRowid so rows a live consumer hasn't passed stay put.
+  archiveCovered(topic: Topic, writer: WriterId, maxSeq: Seq, maxRowid: number, at: string): number {
+    return this.db.transaction(() => {
+      const rows = this.db.all<RawLogRow>(
+        `SELECT rowid, * FROM sq_log WHERE topic = ? AND writer = ? AND seq <= ? AND rowid <= ?`,
+        [topic, writer, maxSeq, maxRowid],
+      );
+      for (const r of rows) {
+        const { entry } = rowToEntry(r);
+        this.db.run(
+          "INSERT OR IGNORE INTO sq_archive (topic, writer, seq, entry, archived_at) VALUES (?, ?, ?, ?, ?)",
+          [topic, writer, r.seq, JSON.stringify(entry), at],
+        );
+      }
+      this.db.run("DELETE FROM sq_log WHERE topic = ? AND writer = ? AND seq <= ? AND rowid <= ?", [
+        topic,
+        writer,
+        maxSeq,
+        maxRowid,
+      ]);
+      return rows.length;
+    });
+  }
+
+  archivedCount(topic: Topic): number {
+    return (
+      this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM sq_archive WHERE topic = ?", [topic])
+        ?.n ?? 0
+    );
+  }
+
+  archivedEntries(topic: Topic, writer: WriterId, fromSeq: Seq, toSeq: Seq): LogEntry[] {
+    return this.db
+      .all<{ entry: string }>(
+        "SELECT entry FROM sq_archive WHERE topic=? AND writer=? AND seq>=? AND seq<=? ORDER BY seq",
+        [topic, writer, fromSeq, toSeq],
+      )
+      .map((r) => JSON.parse(r.entry) as LogEntry);
+  }
+
+  deleteCheckpointsBefore(topic: Topic, view: string, version: string, before: Order): void {
+    this.db.run(
+      `DELETE FROM sq_checkpoints WHERE topic = ? AND view = ? AND view_version = ? AND
+         (ord_l < ? OR (ord_l = ? AND (ord_c < ? OR (ord_c = ? AND
+           (ord_w < ? OR (ord_w = ? AND ord_s < ?))))))`,
+      [topic, view, version, before.l, before.l, before.c, before.c,
+       before.writer, before.writer, before.seq],
+    );
+  }
+
+  earliestCheckpoint(
+    topic: Topic,
+    view: string,
+    version: string,
+  ): { ord: Order; state: string } | undefined {
+    const r = this.db.get<{
+      ord_l: number;
+      ord_c: number;
+      ord_w: string;
+      ord_s: number;
+      state: string;
+    }>(
+      `SELECT ord_l, ord_c, ord_w, ord_s, state FROM sq_checkpoints
+       WHERE topic = ? AND view = ? AND view_version = ?
+       ORDER BY ord_l, ord_c, ord_w, ord_s LIMIT 1`,
+      [topic, view, version],
+    );
+    if (!r) return undefined;
+    return { ord: { l: r.ord_l, c: r.ord_c, writer: r.ord_w, seq: r.ord_s }, state: r.state };
+  }
+
+  minRowidForTopic(topic: Topic): number | null {
+    return (
+      this.db.get<{ m: number | null }>("SELECT MIN(rowid) AS m FROM sq_log WHERE topic = ?", [
+        topic,
+      ])?.m ?? null
+    );
   }
 
   cursorGet(consumer: string, topic: Topic): number {

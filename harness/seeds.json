@@ -1,0 +1,9 @@
+{
+  "note": "Permanent failing-seed corpus (SPEC §19): every seed that ever broke a property joins this list forever, with the property it broke and the fix commit. properties.test.ts replays all of them each run; FRESH_SEEDS=n explores new random seeds and prints them for admission on failure.",
+  "seeds": [
+    { "seed": 20260826, "scenario": "mesh4-loss-partition", "note": "baseline P1/P2/P3 scenario seed" },
+    { "seed": 424242, "scenario": "mesh4-loss-partition", "note": "P5 determinism anchor" },
+    { "seed": 1, "scenario": "mesh4-loss-partition", "note": "P5-negative pair (a)" },
+    { "seed": 2, "scenario": "mesh4-loss-partition", "note": "P5-negative pair (b)" }
+  ]
+}

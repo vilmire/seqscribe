@@ -47,6 +47,8 @@ interface Instance {
   bootstrapPartial: boolean;
   scheduled: boolean;
   materializing: boolean;
+  ftsTable: string | null;
+  ftsCols: string[];
 }
 
 export interface ViewHubDeps {
@@ -75,9 +77,11 @@ export class ViewHub {
     const policy = this.deps.topics.get(topic).policy;
     if (policy.retention.mode !== "full")
       throw misuse(`custom views require retention "full" (${topic}) — ring topics expose only "tail" (§9)`);
-    if (def.fts && def.fts.length > 0) throw misuse("fts views are not implemented yet");
     for (const col of Object.keys(def.schema)) {
       if (!IDENT_RE.test(col)) throw misuse(`bad view column identifier: ${col}`);
+    }
+    for (const col of def.fts ?? []) {
+      if (!(col in def.schema)) throw misuse(`fts column not in schema: ${col}`);
     }
     if (!IDENT_RE.test(def.rowKey) || !(def.rowKey in def.schema))
       throw misuse(`rowKey must be a schema column: ${def.rowKey}`);
@@ -99,12 +103,16 @@ export class ViewHub {
       bootstrapPartial: false,
       scheduled: false,
       materializing: false,
+      ftsTable: def.fts && def.fts.length > 0 ? null : null, // assigned below
+      ftsCols: def.fts ?? [],
     };
+    if (inst.ftsCols.length > 0) inst.ftsTable = `${table}_fts`;
 
     const versionKey = `view_version:${name}`;
     const storedVersion = this.deps.store.metaGet(versionKey);
     if (storedVersion !== undefined && storedVersion !== def.version) {
       this.deps.store.raw().run(`DROP TABLE IF EXISTS "${table}"`);
+      this.deps.store.raw().run(`DROP TABLE IF EXISTS "${table}_fts"`);
       this.deps.store.deleteCheckpoints(topic, name, storedVersion);
     }
     this.deps.store.metaSet(versionKey, def.version);
@@ -112,6 +120,13 @@ export class ViewHub {
       .map((c) => `"${c}" ${def.schema[c]}${c === inst.rowKeyCol ? " PRIMARY KEY" : ""}`)
       .join(", ");
     this.deps.store.raw().run(`CREATE TABLE IF NOT EXISTS "${table}" (${colDefs})`);
+    if (inst.ftsTable) {
+      // FTS indexes are a kind of view (DESIGN §4) — mirrored per batch/delta
+      const ftsCols = [`"${inst.rowKeyCol}" UNINDEXED`, ...inst.ftsCols.filter((c) => c !== inst.rowKeyCol).map((c) => `"${c}"`)];
+      this.deps.store
+        .raw()
+        .run(`CREATE VIRTUAL TABLE IF NOT EXISTS "${inst.ftsTable}" USING fts5(${ftsCols.join(", ")})`);
+    }
 
     this.views.set(name, inst);
     const list = this.byTopic.get(topic) ?? [];
@@ -225,13 +240,34 @@ export class ViewHub {
   async rebuild(name: string): Promise<void> {
     const inst = this.views.get(name);
     if (!inst) throw new SeqscribeError("ERR_UNKNOWN_VIEW", name);
+    // pre-cut history may be archived — rebuild from the base (earliest)
+    // checkpoint, the permanent cut-state floor (§7.6)
+    const base = this.deps.store.earliestCheckpoint(inst.topic, inst.name, inst.def.version);
     this.deps.store.deleteCheckpoints(inst.topic, inst.name, inst.def.version);
-    inst.state = inst.def.init;
-    inst.ord = null;
+    if (base)
+      this.deps.store.checkpointPut(inst.topic, inst.name, inst.def.version, base.ord, base.state);
+    inst.state = base ? (JSON.parse(base.state) as JsonValue) : inst.def.init;
+    inst.ord = base ? base.ord : null;
     inst.lastRowid = 0;
     inst.sinceCheckpoint = 0;
     inst.faulted = false;
-    this.refoldAll(inst);
+    this.refoldFrom(inst, inst.ord);
+    inst.lastRowid = this.deps.store.maxRowid(inst.topic);
+  }
+
+  // §7.6: on cert acceptance the cut state becomes the permanent base
+  // checkpoint and pre-cut checkpoints prune
+  rebaseAtCut(topic: Topic, ord: Order): void {
+    for (const inst of this.byTopic.get(topic) ?? []) {
+      if (inst.faulted) continue;
+      try {
+        const at = this.stateAt(inst.name, ord);
+        this.deps.store.checkpointPut(inst.topic, inst.name, inst.def.version, ord, jcs(at.state));
+        this.deps.store.deleteCheckpointsBefore(inst.topic, inst.name, inst.def.version, ord);
+      } catch {
+        this.fault(inst, null);
+      }
+    }
   }
 
   async settle(): Promise<void> {
@@ -420,14 +456,20 @@ export class ViewHub {
   private rewriteTable(inst: Instance): void {
     const rows = this.sortedRows(inst);
     this.deps.store.raw().run(`DELETE FROM "${inst.table}"`);
+    if (inst.ftsTable) this.deps.store.raw().run(`DELETE FROM "${inst.ftsTable}"`);
     for (const r of rows) this.insertRow(inst, r);
   }
 
   private applyDelta(inst: Instance, d: { upserts: Row[]; deletes: string[] }): void {
-    for (const key of d.deletes)
+    for (const key of d.deletes) {
       this.deps.store
         .raw()
         .run(`DELETE FROM "${inst.table}" WHERE "${inst.rowKeyCol}" = ?`, [key]);
+      if (inst.ftsTable)
+        this.deps.store
+          .raw()
+          .run(`DELETE FROM "${inst.ftsTable}" WHERE "${inst.rowKeyCol}" = ?`, [key]);
+    }
     for (const r of d.upserts) {
       this.validateRow(inst, r);
       this.insertRow(inst, r);
@@ -442,6 +484,18 @@ export class ViewHub {
       sql,
       cols.map((c) => (c === inst.rowKeyCol ? String(r[c] ?? "") : (r[c] ?? null))),
     );
+    if (inst.ftsTable) {
+      const key = String(r[inst.rowKeyCol] ?? "");
+      const ftsCols = [inst.rowKeyCol, ...inst.ftsCols.filter((c) => c !== inst.rowKeyCol)];
+      this.deps.store
+        .raw()
+        .run(`DELETE FROM "${inst.ftsTable}" WHERE "${inst.rowKeyCol}" = ?`, [key]);
+      this.deps.store.raw().run(
+        `INSERT INTO "${inst.ftsTable}" (${ftsCols.map((c) => `"${c}"`).join(", ")})
+         VALUES (${ftsCols.map(() => "?").join(", ")})`,
+        ftsCols.map((c) => (c === inst.rowKeyCol ? key : String(r[c] ?? ""))),
+      );
+    }
   }
 
   private validateRow(inst: Instance, r: Row): void {

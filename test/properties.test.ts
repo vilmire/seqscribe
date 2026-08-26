@@ -143,6 +143,42 @@ async function runScenario(seed: number): Promise<SimResult> {
   return { contigMaps, viewRows, ledger, logDumps };
 }
 
+interface SeedCorpus {
+  seeds: { seed: number; scenario: string; note: string }[];
+}
+
+describe("failing-seed corpus (§19)", () => {
+  it("replays every corpus seed through P1/P2/P3", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const corpus = JSON.parse(
+      readFileSync(join(import.meta.dirname, "..", "harness", "seeds.json"), "utf8"),
+    ) as SeedCorpus;
+    for (const { seed } of corpus.seeds) {
+      const r = await runScenario(seed);
+      for (const m of r.contigMaps) expect(m, `P1 seed=${seed}`).toBe(r.contigMaps[0]);
+      for (const v of r.viewRows) expect(v, `P2 seed=${seed}`).toBe(r.viewRows[0]);
+      expect(r.ledger.length, `P3 seed=${seed}`).toBe(60);
+    }
+  }, 120_000);
+
+  const env = (globalThis as unknown as { process?: { env: Record<string, string | undefined> } })
+    .process?.env;
+  it.skipIf(!env?.FRESH_SEEDS)("explores fresh random seeds (failures join the corpus)", async () => {
+    const n = Number(env?.FRESH_SEEDS ?? 0);
+    for (let i = 0; i < n; i++) {
+      const seed = Math.floor(Math.random() * 2 ** 31); // exploration is allowed to be wall-random
+      // eslint-disable-next-line no-console
+      console.log(`fresh seed: ${seed}`);
+      const r = await runScenario(seed);
+      for (const m of r.contigMaps)
+        expect(m, `P1 FAILED — add seed ${seed} to harness/seeds.json`).toBe(r.contigMaps[0]);
+      for (const v of r.viewRows)
+        expect(v, `P2 FAILED — add seed ${seed} to harness/seeds.json`).toBe(r.viewRows[0]);
+    }
+  }, 600_000);
+});
+
 describe("acceptance properties (§19, scaled)", () => {
   it("P1+P2+P3: convergence, identical views, no loss under loss+partition", async () => {
     const r = await runScenario(20260826);
