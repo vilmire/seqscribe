@@ -38,6 +38,7 @@ function makeNode(
   sched: Scheduler,
   writerId: string,
   policy: TopicPolicy = POLICY,
+  constants: Partial<Constants> = TEST_CONSTANTS,
 ): { node: SeqscribeNode; anomalies: Anomaly[]; conflicts: Conflict[] } {
   const anomalies: Anomaly[] = [];
   const conflicts: Conflict[] = [];
@@ -47,7 +48,7 @@ function makeNode(
     clock: sched.clock(),
     timers: sched.timers(),
     rng: () => 0.7,
-    constants: TEST_CONSTANTS,
+    constants,
     authority: {
       verifyTakeover: (e) =>
         (e.payload as { hostSig?: string } | null)?.hostSig === "valid-takeover",
@@ -315,5 +316,136 @@ describe("owned (§5.8, §11.4)", () => {
     expect(id[1]).toBe("wA");
     await regOf(a.node).settle(T);
     expect(a.node.ownerOf(T, "svc.role")).toBe("wA");
+  });
+});
+
+describe("request expiry (§11.4, P8)", () => {
+  const ownedPolicy: TopicPolicy = {
+    kind: "register",
+    retention: { mode: "full" },
+    replication: "full-sync",
+    access: "content",
+    conflict: { default: "owned" },
+  };
+  const TTL = 10_000;
+  const EXP_CONSTANTS: Partial<Constants> = { ...TEST_CONSTANTS, REQUEST_TTL_MS: TTL };
+
+  // A owns `machine.name`; B requests; nobody ever answers.
+  async function ownedPair(seed: number) {
+    const sched = new Scheduler(1_000);
+    const rng = new SeededRng(seed);
+    const a = makeNode(sched, "wA", ownedPolicy, EXP_CONSTANTS);
+    const b = makeNode(sched, "wB", ownedPolicy, EXP_CONSTANTS);
+    connect(sched, rng, a.node, b.node);
+    await sched.run({ untilMs: 1_300 });
+    void a.node.register(T).set("machine.name", "alpha");
+    await sched.run({ untilMs: 2_500 });
+    return { sched, a, b };
+  }
+
+  it("expires an unclaimed request — query-time derivation, requester state untouched", async () => {
+    const { sched, a, b } = await ownedPair(60);
+
+    void b.node.register(T).request("machine.name", "beta");
+    await sched.run({ untilMs: 4_000 });
+    await regOf(a.node).settle(T);
+    await regOf(b.node).settle(T);
+    const pending = a.node.pendingRequests(T);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ requester: "wB", value: "beta", key: "machine.name" });
+    expect(b.node.pendingRequests(T)).toHaveLength(1);
+
+    // drive the clock past the TTL: the request expires unclaimed
+    const reqAt = pending[0]!.at.l;
+    await sched.run({ untilMs: reqAt + TTL + 1_000 });
+    expect(a.node.pendingRequests(T)).toHaveLength(0);
+    expect(b.node.pendingRequests(T)).toHaveLength(0);
+
+    // §11.4: "expiry is query-time derivation (pendingRequests(topic, now))" —
+    // nothing is appended or mutated, so a pre-expiry `now` still sees it
+    expect(a.node.pendingRequests(T, reqAt + 1)).toHaveLength(1);
+
+    // requester's state on expiry: no grant, no anomaly, winner untouched
+    expect((await winner(sched, a.node, "machine.name"))?.value).toBe("alpha");
+    expect((await winner(sched, b.node, "machine.name"))?.value).toBe("alpha");
+    expect(a.anomalies).toHaveLength(0);
+    expect(b.anomalies).toHaveLength(0);
+
+    // the requester's remedy is simply a fresh request
+    void b.node.register(T).request("machine.name", "beta2");
+    await sched.run({ untilMs: sched.now() + 2_000 });
+    await regOf(a.node).settle(T);
+    expect(a.node.pendingRequests(T)).toHaveLength(1);
+    expect(a.node.pendingRequests(T)[0]?.value).toBe("beta2");
+  });
+
+  it("grants before expiry; a granted request never re-enters pending after the TTL", async () => {
+    const { sched, a, b } = await ownedPair(61);
+    a.node.onOwnedRequest(T, async () => "approve");
+
+    void b.node.register(T).request("machine.name", "beta");
+    await sched.run({ untilMs: 6_000 }); // well inside the TTL
+    expect((await winner(sched, a.node, "machine.name"))?.value).toBe("beta");
+    expect((await winner(sched, b.node, "machine.name"))?.value).toBe("beta");
+    expect(a.node.pendingRequests(T)).toHaveLength(0); // approvedBy set, not expiry
+
+    await sched.run({ untilMs: sched.now() + TTL + 5_000 }); // now also past the TTL
+    expect(a.node.pendingRequests(T)).toHaveLength(0);
+    expect((await winner(sched, a.node, "machine.name"))?.value).toBe("beta");
+  });
+
+  it("expiry racing a grant: a decision still in flight at the TTL boundary lands as an owner set", async () => {
+    const { sched, a, b } = await ownedPair(62);
+
+    // the owner's approval callback stalls until we release it
+    let release!: (v: "approve" | "deny") => void;
+    const verdict = new Promise<"approve" | "deny">((r) => (release = r));
+    a.node.onOwnedRequest(T, () => verdict);
+
+    void b.node.register(T).request("machine.name", "late-grant");
+    await sched.run({ untilMs: 4_000 });
+    expect(a.node.pendingRequests(T)).toHaveLength(1); // asked, undecided
+
+    // expiry passes first: the request drops out of pending everywhere
+    const reqAt = a.node.pendingRequests(T)[0]!.at.l;
+    await sched.run({ untilMs: reqAt + TTL + 2_000 });
+    expect(a.node.pendingRequests(T)).toHaveLength(0);
+    expect(b.node.pendingRequests(T)).toHaveLength(0);
+
+    // …then the grant resolves. §11.4 makes expiry a pendingRequests-only
+    // derivation; the approval appends an owner `set` (with ref), which is
+    // always a valid owner write — so the late grant still applies.
+    release("approve");
+    await sched.run({ untilMs: sched.now() + 4_000 });
+    expect((await winner(sched, a.node, "machine.name"))?.value).toBe("late-grant");
+    expect((await winner(sched, b.node, "machine.name"))?.value).toBe("late-grant");
+    expect(a.node.pendingRequests(T)).toHaveLength(0);
+    expect(a.anomalies).toHaveLength(0);
+  });
+
+  it("grant-then-expiry vs expiry-then-grant converge to the same final state", async () => {
+    // order 1: approve immediately, then pass the TTL
+    const first = await ownedPair(63);
+    first.a.node.onOwnedRequest(T, async () => "approve");
+    void first.b.node.register(T).request("machine.name", "vX");
+    await first.sched.run({ untilMs: 6_000 });
+    await first.sched.run({ untilMs: first.sched.now() + TTL + 2_000 });
+
+    // order 2: let the TTL pass mid-decision, then approve
+    const second = await ownedPair(63);
+    let release!: (v: "approve" | "deny") => void;
+    second.a.node.onOwnedRequest(T, () => new Promise((r) => (release = r)));
+    void second.b.node.register(T).request("machine.name", "vX");
+    await second.sched.run({ untilMs: 4_000 });
+    await second.sched.run({ untilMs: second.sched.now() + TTL + 2_000 });
+    release("approve");
+    await second.sched.run({ untilMs: second.sched.now() + 4_000 });
+
+    for (const s of [first, second]) {
+      expect((await winner(s.sched, s.a.node, "machine.name"))?.value).toBe("vX");
+      expect((await winner(s.sched, s.b.node, "machine.name"))?.value).toBe("vX");
+      expect(s.a.node.pendingRequests(T)).toHaveLength(0);
+      expect(s.b.node.pendingRequests(T)).toHaveLength(0);
+    }
   });
 });
