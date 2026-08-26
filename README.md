@@ -23,4 +23,9 @@ Extracted from and dogfooded by [ADHDev](https://adhf.dev). Maintained for our n
 
 ## License
 
-[FSL-1.1-Apache-2.0](LICENSE) — the Functional Source License: embed it in anything, build products and internal systems on it freely; the only restricted use is offering seqscribe itself as a competing commercial product or service. Each release automatically becomes Apache-2.0 two years after publication. (The pre-implementation npm placeholder 0.0.1 was published under MIT and remains so; every version from the implementation onward is FSL.)
+Dual-licensed — **[FSL-1.1-Apache-2.0](LICENSE-FSL) OR [AGPL-3.0-only](LICENSE-AGPL), at your option** ([LICENSE](LICENSE)):
+
+- **FSL** for embedders: use it in anything, build products and internal systems freely; the only restricted use is offering seqscribe itself as a competing commercial product or service. Each release automatically becomes Apache-2.0 two years after publication.
+- **AGPL** for copyleft works: combine with AGPL projects (including the ADHDev OSS tier) with full open-source compatibility.
+
+Free-riding is blocked on both legs — FSL forbids competing offerings outright; AGPL forces them fully open. (The pre-implementation npm placeholder 0.0.1 was published under MIT and remains so; every version from the implementation onward is dual FSL/AGPL.)

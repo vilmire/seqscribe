@@ -5,7 +5,7 @@
 
 > Status: **v1 architecture record** (2026-08-25 exploration → 2026-08-26 fifteen decisions stamped, §10). Detailed spec = [SPEC.md](SPEC.md). **The normative contract is SPEC alone; this document is background and decision history (non-normative)** — where they conflict, SPEC wins (settled in the v2 revision incorporating three external reviews, 2026-08-26).
 
-**One-line definition**: an **embeddable, transport-agnostic** sync library that replicates writer-owned append-only logs peer-to-peer with cursor-based resumption, materializing them into derived SQLite views. FSL-1.1-Apache-2.0 (relicensed from MIT, 2026-08-26).
+**One-line definition**: an **embeddable, transport-agnostic** sync library that replicates writer-owned append-only logs peer-to-peer with cursor-based resumption, materializing them into derived SQLite views. Dual FSL-1.1-Apache-2.0 OR AGPL-3.0-only (MIT → FSL → dual, all 2026-08-26).
 
 **Positioning**: "y-webrtc for SQLite". Market slot = **SQLite semantics × true P2P (no server anchor) × BYO transport** — no production-grade incumbent as of the 2026-08 survey (§3).
 
@@ -199,7 +199,7 @@ node.onConflict("config.settings", async (c) => {
 
 ## 8. Packages, repo, license
 
-- Separate repo (`vilmire/seqscribe`), **FSL-1.1-Apache-2.0** (originally stamped MIT; relicensed 2026-08-26 before any implementation release — permissive for embedding, restricted only against competing hosted offerings, auto-Apache-2.0 after two years. The MIT-licensed npm placeholder 0.0.1 predates the implementation and carries none of it). Candidate third submodule for the ADHDev monorepo.
+- Separate repo (`vilmire/seqscribe`), **dual FSL-1.1-Apache-2.0 OR AGPL-3.0-only** (originally stamped MIT; → FSL, then → dual, both 2026-08-26 before any implementation release. The AGPL leg exists so the AGPL ADHDev OSS tier can depend on seqscribe directly — the unified single-data-plane architecture — while the FSL leg keeps embedding permissive and both legs block free-riding. The MIT npm placeholder 0.0.1 predates the implementation and carries none of it). Candidate third submodule for the ADHDev monorepo.
 - Packages: `seqscribe` (core, pure TS) / `seqscribe-ws` (reference transport) / `seqscribe-beacon` (reference beacon, §5.7) / storage adapters (`@seqscribe/*` or `seqscribe-*`).
 - npm name `seqscribe` reserved (placeholder 0.0.1 published 2026-08-26). GitHub org `seqscribe` secured.
 - Positioning: "extracted from ADHDev, maintained for our needs" — keeps the maintenance debt proportional to scope.
