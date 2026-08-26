@@ -477,7 +477,12 @@ export class SubHub {
     }
     sub.chunks.clear();
     sub.chunksOf = 0;
+    // The reassembled body is peer-supplied: it must be a JCS row array (§5.4)
+    // before it reaches subscriber callbacks. A bad body throws — the Session
+    // dispatch guard turns that into ERR + drop instead of a host-visible crash.
     const rows = JSON.parse(textDec.decode(total)) as Row[];
+    if (!Array.isArray(rows))
+      throw new SeqscribeError("ERR_ENTRY_ENCODING", "SNAP body is not a row array");
     sub.cursor = m.cursor;
     for (const cb of sub.snapshotCbs) cb(rows, sub.chunkReset);
   }

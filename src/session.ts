@@ -269,7 +269,20 @@ export class Session {
       this.sendControl({ t: "ERR", code, detail: "unparseable frame" });
       return;
     }
+    // A handler failure is a protocol error, not a transport fault: it gets the
+    // same ERR-and-drop discipline as an unparseable frame. Nothing may throw
+    // into the host's Channel.onMessage callback (§5.1 — the Channel is the
+    // host's transport; its callbacks are not our error path). Dropped frames
+    // recover via the §5.2/§5.3 retry machinery, exactly like frame loss.
+    try {
+      this.dispatch(m);
+    } catch (e) {
+      const code = e instanceof SeqscribeError ? e.code : "ERR_ENTRY_ENCODING";
+      this.sendControl({ t: "ERR", code, detail: `${m.t} handler failed` });
+    }
+  }
 
+  private dispatch(m: WireMsg): void {
     if (m.t === "HELLO") {
       this.onHello(m);
       return;
@@ -327,6 +340,23 @@ export class Session {
   private onDataMsg(m: DataMsg): void {
     if (m.mid <= this.recvContigMid) {
       this.sendControl({ t: "ACK", upTo: this.recvContigMid }); // duplicate — re-ACK
+      return;
+    }
+    // §5.2 credit-window bound: a conforming sender keeps unACKed ≤
+    // INFLIGHT_CREDITS and ACK advances only to the contiguous mid, so every
+    // legitimate data frame satisfies mid ≤ recvContigMid + INFLIGHT_CREDITS
+    // (mids are consecutive; the sender's window starts at our last ACK, which
+    // is never ahead of recvContigMid). Beyond that is credit abuse or a
+    // desynced peer — either way recvBuffer would grow without bound. §5 names
+    // no lighter response, so the conservative one: ERR + close (the host
+    // redials; mids/credits reset per §5.2).
+    if (m.mid > this.recvContigMid + this.c.INFLIGHT_CREDITS) {
+      this.sendControl({
+        t: "ERR",
+        code: "ERR_ENTRY_ENCODING",
+        detail: `data mid ${m.mid} beyond credit window`,
+      });
+      this.close();
       return;
     }
     this.recvBuffer.set(m.mid, m);

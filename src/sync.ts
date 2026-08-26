@@ -288,7 +288,10 @@ export class SyncEngine {
       if (!myCert && (v.fgen ?? 0) > 0) continue;
       for (const [writer, w] of Object.entries(v.writers)) {
         const head = this.o.core.getStream(topic, writer);
-        // authoritative knowledge refresh from the peer's own HAVE
+        // authoritative knowledge refresh from the peer's own HAVE — writer
+        // names are charter-validated at parseMsg (§1 regexes); ps.known growth
+        // is bounded only by the peer's real writer census, which sits inside
+        // the §4.1 full-sync trust boundary (grants are the containment line)
         ps.known.set(`${topic}\u0000${writer}`, "retired" in w ? w.finalSeq : w.contig);
         const peerRgen = w.rgen ?? 0;
         // rgen lag rule (§13): a peer advertising a lower rgen gets the latest directive
