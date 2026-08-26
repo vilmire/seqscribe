@@ -49,6 +49,10 @@ interface Instance {
   materializing: boolean;
   ftsTable: string | null;
   ftsCols: string[];
+  // delta-less views: last written rows (rowKey → JCS(row)) so each batch
+  // writes O(changes) instead of rewriting the table, and subscribers get
+  // real diff-derived deltas instead of a SNAP reset per batch (proposals-v3.5)
+  rowCache: Map<string, string> | null;
 }
 
 export interface ViewHubDeps {
@@ -105,6 +109,7 @@ export class ViewHub {
       materializing: false,
       ftsTable: def.fts && def.fts.length > 0 ? null : null, // assigned below
       ftsCols: def.fts ?? [],
+      rowCache: null,
     };
     if (inst.ftsCols.length > 0) inst.ftsTable = `${table}_fts`;
 
@@ -350,12 +355,11 @@ export class ViewHub {
             if (inst.sinceCheckpoint >= this.deps.constants.CHECKPOINT_EVERY)
               this.checkpoint(inst);
           }
-          if (!inst.def.delta) this.rewriteTable(inst);
+          if (!inst.def.delta) this.diffSyncTable(inst, changes);
           inst.lastRowid = lastRowid;
         });
-        if (inst.def.delta && (changes.upserts.length > 0 || changes.deletes.length > 0))
+        if (changes.upserts.length > 0 || changes.deletes.length > 0)
           this.emitChange(inst, { ...changes, reset: false });
-        if (!inst.def.delta) this.emitChange(inst, { upserts: [], deletes: [], reset: true });
       }
     } catch (e) {
       this.fault(inst, e);
@@ -458,6 +462,45 @@ export class ViewHub {
     this.deps.store.raw().run(`DELETE FROM "${inst.table}"`);
     if (inst.ftsTable) this.deps.store.raw().run(`DELETE FROM "${inst.ftsTable}"`);
     for (const r of rows) this.insertRow(inst, r);
+    if (!inst.def.delta) {
+      inst.rowCache = new Map(rows.map((r) => [String(r[inst.rowKeyCol] ?? ""), jcs(r as unknown as JsonValue)]));
+    }
+  }
+
+  // delta-less fast path: write only the rows that changed since the last
+  // batch and collect them as deltas for subscribers
+  private diffSyncTable(
+    inst: Instance,
+    changes: { upserts: Row[]; deletes: string[] },
+  ): void {
+    if (inst.rowCache === null) {
+      this.rewriteTable(inst);
+      return;
+    }
+    // no sort, one serialization per row: order is irrelevant to a diff, and
+    // the JCS string doubles as the size check and the comparison key
+    const next = new Map<string, { row: Row; ser: string }>();
+    for (const r of inst.def.rows(inst.state)) {
+      const ser = jcs(r as unknown as JsonValue);
+      if (utf8ByteLength(ser) > this.deps.constants.MAX_ROW_BYTES)
+        throw new SeqscribeError("ERR_ENTRY_TOO_LARGE", `view row > MAX_ROW_BYTES (${inst.name})`);
+      next.set(String(r[inst.rowKeyCol] ?? ""), { row: r, ser });
+    }
+    for (const [key, entry] of next) {
+      if (inst.rowCache.get(key) !== entry.ser) {
+        this.insertRow(inst, entry.row);
+        changes.upserts.push(entry.row);
+      }
+    }
+    for (const key of inst.rowCache.keys()) {
+      if (!next.has(key)) {
+        this.deps.store.raw().run(`DELETE FROM "${inst.table}" WHERE "${inst.rowKeyCol}" = ?`, [key]);
+        if (inst.ftsTable)
+          this.deps.store.raw().run(`DELETE FROM "${inst.ftsTable}" WHERE "${inst.rowKeyCol}" = ?`, [key]);
+        changes.deletes.push(key);
+      }
+    }
+    inst.rowCache = new Map([...next].map(([k, v]) => [k, v.ser]));
   }
 
   private applyDelta(inst: Instance, d: { upserts: Row[]; deletes: string[] }): void {

@@ -122,6 +122,11 @@ export class LogCore {
   private hlcState: HlcState;
   private readonly heads = new Map<string, WriterRow>();
   private readonly certs = new Map<Topic, FinalityCert | null>();
+  // incrementally maintained HAVE vectors — a fleet at the envelope has
+  // thousands of topics, and rebuilding O(total streams) per HAVE_GET per peer
+  // is the scan this cache removes. Expired tombstones may linger in the cache
+  // until the next head write (TOMBSTONE_RETAIN_MS is a soft exposure bound).
+  private vectorsCache: HaveVectors | null = null;
   private readonly recoveries = new Map<string, RecoveryTarget>();
   private readonly rings = new Map<Topic, LogEntry[]>();
   private queue: QueueItem[] = [];
@@ -262,29 +267,51 @@ export class LogCore {
     return head;
   }
 
+  // Persist a stream head and keep the HAVE vector cache in step.
+  private saveHead(head: WriterRow): void {
+    this.store.upsertWriter(head);
+    if (this.vectorsCache) {
+      const topicVec = (this.vectorsCache[head.topic] ??= { writers: {} });
+      this.applyHeadToVec(topicVec, head, this.clock() - this.constants.TOMBSTONE_RETAIN_MS);
+    }
+  }
+
+  private applyHeadToVec(
+    topicVec: HaveVectors[Topic],
+    w: WriterRow,
+    tombstoneFloor: number,
+  ): void {
+    if (w.sealReason === "retired" && w.finalSeq !== null && w.finalChain !== null) {
+      // TOMBSTONE_RETAIN_MS bounds HAVE exposure only; sq_writers rows are
+      // permanent — no resurrection at day 401 (§8)
+      if (w.retiredAt !== null && Date.parse(w.retiredAt) < tombstoneFloor) {
+        delete topicVec.writers[w.writer];
+        return;
+      }
+      topicVec.writers[w.writer] = {
+        retired: true,
+        finalSeq: w.finalSeq,
+        finalChain: w.finalChain,
+        rgen: w.rgen,
+      };
+      return;
+    }
+    const live: { contig: Seq; chain: string; rgen?: number } = {
+      contig: w.contigSeq,
+      chain: w.contigChain,
+    };
+    if (w.rgen > 0) live.rgen = w.rgen;
+    topicVec.writers[w.writer] = live;
+  }
+
+  // NOTE: the returned object is the live cache — callers read, never mutate.
   vectors(): HaveVectors {
+    if (this.vectorsCache) return this.vectorsCache;
     const out: HaveVectors = {};
     const tombstoneFloor = this.clock() - this.constants.TOMBSTONE_RETAIN_MS;
     for (const w of this.store.listWriters()) {
       const topicVec = (out[w.topic] ??= { writers: {} });
-      if (w.sealReason === "retired" && w.finalSeq !== null && w.finalChain !== null) {
-        // TOMBSTONE_RETAIN_MS bounds HAVE exposure only; sq_writers rows are
-        // permanent — no resurrection at day 401 (§8)
-        if (w.retiredAt !== null && Date.parse(w.retiredAt) < tombstoneFloor) continue;
-        topicVec.writers[w.writer] = {
-          retired: true,
-          finalSeq: w.finalSeq,
-          finalChain: w.finalChain,
-          rgen: w.rgen,
-        };
-      } else {
-        const live: { contig: Seq; chain: string; rgen?: number } = {
-          contig: w.contigSeq,
-          chain: w.contigChain,
-        };
-        if (w.rgen > 0) live.rgen = w.rgen;
-        topicVec.writers[w.writer] = live;
-      }
+      this.applyHeadToVec(topicVec, w, tombstoneFloor);
     }
     // every defined full-sync topic appears even with no writers — the fgen
     // repair path (§7.4) needs the row to compare against, and a fresh replica
@@ -295,6 +322,7 @@ export class LogCore {
       const cert = this.getCert(topic);
       if (cert) topicVec.fgen = cert.generation;
     }
+    this.vectorsCache = out;
     return out;
   }
 
@@ -357,6 +385,7 @@ export class LogCore {
       // invalidate caches that may have advanced inside the aborted txn.
       this.heads.clear();
       this.certs.clear();
+      this.vectorsCache = null;
       const e =
         err instanceof SeqscribeError
           ? err
@@ -375,7 +404,7 @@ export class LogCore {
     const head = this.getStream(item.topic, item.writer);
     if (head.sealReason === null) {
       head.sealReason = "fork";
-      this.store.upsertWriter(head);
+      this.saveHead(head);
       anomalies.push({ kind: "writer_forked" });
     }
     settle.push(() => item.resolve());
@@ -390,6 +419,7 @@ export class LogCore {
     let quarantined = 0;
     this.store.finalitySet(cert.topic, JSON.stringify(cert));
     this.certs.set(cert.topic, cert);
+    if (this.vectorsCache) (this.vectorsCache[cert.topic] ??= { writers: {} }).fgen = cert.generation;
 
     for (const w of this.store.listWriters(cert.topic)) {
       const head = this.getStream(cert.topic, w.writer);
@@ -418,7 +448,7 @@ export class LogCore {
           head.sealReason = "fork";
           anomalies.push({ kind: "writer_forked" });
         }
-        this.store.upsertWriter(head);
+        this.saveHead(head);
         continue;
       }
 
@@ -430,7 +460,7 @@ export class LogCore {
           // (canonical re-fetch) lands with directives; the seal is immediate
           if (head.sealReason === null) {
             head.sealReason = "fork";
-            this.store.upsertWriter(head);
+            this.saveHead(head);
             anomalies.push({ kind: "writer_forked" });
           }
         }
@@ -478,7 +508,7 @@ export class LogCore {
       head.retiredAt = null;
       head.finalSeq = null;
       head.finalChain = null;
-      this.store.upsertWriter(head);
+      this.saveHead(head);
       this.recoveries.delete(key);
       done("applied");
       return;
@@ -509,7 +539,7 @@ export class LogCore {
       head.retiredAt = now;
       head.finalSeq = finalSeq;
       head.finalChain = finalChain;
-      this.store.upsertWriter(head);
+      this.saveHead(head);
       this.recoveries.delete(key);
       done("applied");
       return;
@@ -519,7 +549,7 @@ export class LogCore {
     // via rewind-on-mismatch during canonical ingest; step 5 on completion)
     if (head.sealReason === null) {
       head.sealReason = "fork";
-      this.store.upsertWriter(head);
+      this.saveHead(head);
     }
     this.recoveries.set(key, { finalSeq, finalChain, rgen: d.rgen, unavailableReported: false });
     done("recovery");
@@ -531,7 +561,7 @@ export class LogCore {
       if (head.contigSeq < cut.seq) {
         head.contigSeq = cut.seq;
         head.contigChain = cut.chain;
-        this.store.upsertWriter(head);
+        this.saveHead(head);
       }
     }
     settle.push(() => item.resolve());
@@ -568,7 +598,7 @@ export class LogCore {
           ? seedOf(e.topic, e.writer)
           : this.store.getEntry(e.topic, e.writer, head.contigSeq)?.chain;
       if (prev !== undefined) head.contigChain = prev;
-      this.store.upsertWriter(head);
+      this.saveHead(head);
     }
     if (e.seq !== head.contigSeq + 1) {
       done("pending"); // recovery pulls contiguously via WANT — skip gaps
@@ -582,7 +612,7 @@ export class LogCore {
     const rowid = this.persist(e);
     head.contigSeq = e.seq;
     head.contigChain = e.chain;
-    this.store.upsertWriter(head);
+    this.saveHead(head);
     applied.push({ entry: e, rowid, via });
     if (head.contigSeq === target.finalSeq) {
       if (head.contigChain === target.finalChain) {
@@ -591,7 +621,7 @@ export class LogCore {
         head.retiredAt = now;
         head.finalSeq = target.finalSeq;
         head.finalChain = target.finalChain;
-        this.store.upsertWriter(head);
+        this.saveHead(head);
         this.recoveries.delete(`${e.topic} ${e.writer}`);
       }
     }
@@ -647,7 +677,7 @@ export class LogCore {
     const rowid = this.persist(entry);
     head.contigSeq = seq;
     head.contigChain = entry.chain;
-    this.store.upsertWriter(head);
+    this.saveHead(head);
     applied.push({ entry, rowid, via: undefined });
     const id: EntryId = [entry.topic, entry.writer, entry.seq];
     settle.push(() => item.resolve(id));
@@ -755,7 +785,7 @@ export class LogCore {
     const rowid = this.persist(e);
     head.contigSeq = e.seq;
     head.contigChain = e.chain;
-    this.store.upsertWriter(head);
+    this.saveHead(head);
     applied.push({ entry: e, rowid, via });
     return "applied";
   }
@@ -799,7 +829,7 @@ export class LogCore {
 
   private seal(head: WriterRow, offending: LogEntry, anomalies: Anomaly[]): void {
     head.sealReason = "fork";
-    this.store.upsertWriter(head);
+    this.saveHead(head);
     anomalies.push({ kind: "writer_forked", entry: offending });
   }
 }

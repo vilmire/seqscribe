@@ -4,3 +4,5 @@ dist/
 .DS_Store
 types.d.ts
 e2e-browser/main.js
+e2e-browser/dashboard-worker.js
+e2e-browser/dashboard-main.js

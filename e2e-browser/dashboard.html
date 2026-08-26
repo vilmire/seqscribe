@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>seqscribe fleet dashboard</title>
+<body style="font-family: ui-monospace, monospace; background: #0d1117; color: #d0d7de; padding: 1.2rem; margin: 0;">
+<div style="display: flex; align-items: center; gap: .8rem;">
+  <div id="spinner" style="width: 18px; height: 18px; border: 3px solid #30363d; border-top-color: #58a6ff; border-radius: 50%;"></div>
+  <h3 style="margin: 0;">seqscribe fleet dashboard <span style="color:#8b949e">(node runs in a worker)</span></h3>
+</div>
+<p id="status" style="color:#8b949e">booting…</p>
+<p id="jank" style="color:#8b949e"></p>
+<div style="display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 1rem;">
+  <div><h4>mesh.events → local ledger view</h4><pre id="ledger"></pre></div>
+  <div><h4>fleet.status (ring tail SUB)</h4><pre id="fleet"></pre></div>
+  <div><h4>config.settings (register SUB)</h4><pre id="config"></pre></div>
+</div>
+<pre id="result" style="color:#7ee787"></pre>
+<script type="module" src="./dashboard-main.js"></script>
+</body>

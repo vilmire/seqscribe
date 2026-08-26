@@ -39,7 +39,8 @@
     "gen:vectors": "node tools/gen-vectors.mjs",
     "gen:types": "node tools/gen-types.mjs",
     "check": "npm run gen:types && tsc --noEmit --strict --skipLibCheck types.d.ts && tsc --noEmit && vitest run && npm run build && tsc -p fixture",
-    "e2e:browser": "npm run build && npx esbuild e2e-browser/main.src.js --bundle --format=esm --platform=browser --outfile=e2e-browser/main.js '--external:/@sqlite.org/*' && node e2e-browser/server.mjs 8971"
+    "e2e:browser": "npm run build && npx esbuild e2e-browser/main.src.js --bundle --format=esm --platform=browser --outfile=e2e-browser/main.js '--external:/@sqlite.org/*' && node e2e-browser/server.mjs 8971",
+    "e2e:dashboard": "npm run build && npx esbuild e2e-browser/dashboard-worker.src.js --bundle --format=esm --platform=browser --outfile=e2e-browser/dashboard-worker.js '--external:/@sqlite.org/*' && npx esbuild e2e-browser/dashboard-main.src.js --bundle --format=esm --outfile=e2e-browser/dashboard-main.js && node e2e-browser/dashboard-server.mjs 8972"
   },
   "dependencies": {
     "@noble/hashes": "^1.4.0",

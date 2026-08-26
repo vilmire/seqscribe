@@ -51,6 +51,28 @@ The library detects, freezes, and gathers evidence; it never chooses a branch. W
 
 Post-cut quarantine (§7.5a — a writer's applied tail fell outside a late-arriving cut) resolves through the *same* directive machinery: canonicalize at the cut, new writerId for the author.
 
+## 3.5 View reducer discipline (measured)
+
+`reduce` is pure and non-mutating (§9), so a naive `{...state, key: v}` reducer copies the whole state per entry — **O(state) per entry, quadratic per topic**. Measured: a 20k-key spread-copy reducer costs ~35 s for 20k entries, of which the library's share is noise (table writes are diffed to O(changes) per batch). For views whose state grows with the log:
+
+- shape state so each entry touches a small sub-object (e.g. `{buckets: {…}}` and copy only the affected bucket), or
+- provide `delta` and keep rows-per-entry small — `rows()` is still authoritative and verified at checkpoints.
+
+Small/bounded views (config mirrors, counters) can ignore this entirely.
+
+## 3.6 Browser deployment shape (verified)
+
+Run the node in a **dedicated module worker**: sqlite-wasm with the OPFS
+SAH-pool VFS (persistent, no COOP/COEP headers needed), the WebSocket, sync,
+views, and subscriptions all live there; the main thread only renders worker
+messages. Verified in Chromium (`npm run e2e:dashboard`, e2e-browser/): a
+live ADHDev-shaped dashboard — full-synced `mesh.events` with a LOCAL ledger
+view (offline-readable, resumes from OPFS across reloads), `fleet.status`
+ring-tail SUB, `config.settings` register SUB — sustained a 400-query burst
+in the worker with **zero main-thread long tasks** (Long Tasks API). Running
+the node on the main thread works but blocks the UI for the duration of every
+query and commit — don't ship that shape.
+
 ## 4. Consumer discipline: provisional vs finalized-only
 
 Every `onEntry` delivery is **provisional until covered by a certificate** (§7.5). Choose per consumer:

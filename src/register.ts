@@ -30,6 +30,16 @@ import type {
 } from "./types.js";
 
 const ANCESTOR_WALK_CAP = 1024;
+// long-lived dedupe sets are FIFO-capped: eviction only risks re-surfacing an
+// old conflict/request callback, and both paths are at-least-once by design
+const DEDUPE_CAP = 8192;
+
+function capSet(s: Set<string>): void {
+  while (s.size > DEDUPE_CAP) {
+    const first = s.values().next().value as string;
+    s.delete(first);
+  }
+}
 
 interface MemberState {
   present: boolean;
@@ -687,6 +697,7 @@ export class RegisterHub {
     const sig = `${topic}\u0000${key}\u0000${member ?? ""}\u0000${jcs(frontier as unknown as JsonValue)}`;
     if (this.surfacedConflicts.has(sig)) return;
     this.surfacedConflicts.add(sig);
+    capSet(this.surfacedConflicts);
 
     const entries = frontier
       .map((h) => this.deps.store.getEntry(topic, h[1], h[2]))
@@ -718,6 +729,7 @@ export class RegisterHub {
     const sig = `${topic}\u0000${jcs(req.entry as unknown as JsonValue)}`;
     if (this.handledRequests.has(sig)) return;
     this.handledRequests.add(sig);
+    capSet(this.handledRequests);
     const reg = this.handle(topic);
     for (const cb of this.requestCbs.get(topic) ?? []) {
       const verdict = await cb({

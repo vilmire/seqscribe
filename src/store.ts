@@ -104,6 +104,11 @@ function rowToEntry(r: RawLogRow): { entry: LogEntry; rowid: number } {
 }
 
 export class Store {
+  // count caches: exact via +1 on insert, invalidated (recount lazily) on any
+  // delete/archive — stats() must not pay a COUNT(*) table scan per call
+  private readonly logCounts = new Map<Topic, number>();
+  private readonly archiveCounts = new Map<Topic, number>();
+
   constructor(private readonly db: SqliteHandle) {}
 
   init(durability: "normal" | "full"): void {
@@ -150,6 +155,8 @@ export class Store {
         e.chain,
       ],
     );
+    const cached = this.logCounts.get(e.topic);
+    if (cached !== undefined) this.logCounts.set(e.topic, cached + 1);
     return Number(res.lastInsertRowid);
   }
 
@@ -370,6 +377,7 @@ export class Store {
       writer,
       fromSeq,
     ]);
+    this.logCounts.delete(topic); // recount lazily
   }
 
   checkpointPut(
@@ -459,15 +467,25 @@ export class Store {
         return rows.length;
       });
       total += moved;
-      if (moved < BATCH) return total;
+      if (moved < BATCH) {
+        if (total > 0) {
+          this.logCounts.delete(topic); // recount lazily
+          const a = this.archiveCounts.get(topic);
+          if (a !== undefined) this.archiveCounts.set(topic, a + total);
+        }
+        return total;
+      }
     }
   }
 
   archivedCount(topic: Topic): number {
-    return (
+    const cached = this.archiveCounts.get(topic);
+    if (cached !== undefined) return cached;
+    const n =
       this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM sq_archive WHERE topic = ?", [topic])
-        ?.n ?? 0
-    );
+        ?.n ?? 0;
+    this.archiveCounts.set(topic, n);
+    return n;
   }
 
   archivedEntries(topic: Topic, writer: WriterId, fromSeq: Seq, toSeq: Seq): LogEntry[] {
@@ -511,10 +529,13 @@ export class Store {
   }
 
   logCount(topic: Topic): number {
-    return (
+    const cached = this.logCounts.get(topic);
+    if (cached !== undefined) return cached;
+    const n =
       this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM sq_log WHERE topic = ?", [topic])?.n ??
-      0
-    );
+      0;
+    this.logCounts.set(topic, n);
+    return n;
   }
 
   pendingCountForTopic(topic: Topic): number {
