@@ -8,8 +8,10 @@ import {
   chainOf,
   coreOf,
   createSeqscribe,
+  DEFAULT_CONSTANTS,
   SeqscribeError,
   seedOf,
+  validateEntry,
 } from "../src/index.js";
 import type { Anomaly, LogEntry, SeqscribeNode, TopicPolicy } from "../src/index.js";
 
@@ -92,6 +94,26 @@ describe("author append path", () => {
     await sched.run();
     const ids = await Promise.all(ps);
     expect(ids.map(([, , s]) => s)).toEqual(Array.from({ length: 200 }, (_, i) => i + 1));
+  });
+});
+
+describe("canonical strip at ingress (§2/§4)", () => {
+  it("drops unknown fields without disturbing the chain", async () => {
+    const sched = new Scheduler(2000);
+    const [e] = await authorEntries(sched, 1);
+    const junked = {
+      ...e!,
+      junk: "rides-along",
+      hlc: { ...e!.hlc, junk: 2 },
+    } as unknown;
+
+    const clean = validateEntry(junked, DEFAULT_CONSTANTS);
+    expect(Object.keys(clean).sort()).toEqual(
+      Object.keys(e!).sort(), // exactly the authored §2 fields, nothing extra
+    );
+    expect(Object.keys(clean.hlc).sort()).toEqual(["c", "l"]);
+    // §4 chainOf never covered the extras, so the stripped entry still chains
+    expect(chainOf(seedOf(T, "w1"), clean)).toBe(clean.chain);
   });
 });
 

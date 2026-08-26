@@ -79,7 +79,26 @@ export function validateEntry(e: unknown, constants: Constants): LogEntry {
   if (typeof o.chain !== "string" || !CHAIN_RE.test(o.chain))
     throw new SeqscribeError("ERR_ENTRY_ENCODING", "invalid chain (lowercase hex64 required)");
 
-  const entry = e as LogEntry;
+  // Rebuild from the §2 fields rather than returning the input object: §4
+  // chainOf covers only the enumerated fields, so unknown extras would ride
+  // along unauthenticated — surviving pending-table JSON round-trips while
+  // sq_log drops them, and two entries differing only in junk would share a
+  // chain. Stripping here makes every ingress path canonical (and is what
+  // both sides of a mixed-version fleet already agree on hashing).
+  const entry: LogEntry = {
+    topic: o.topic,
+    writer: o.writer,
+    seq: o.seq,
+    hlc: { l: hlc.l as number, c: hlc.c as number },
+    kind: o.kind,
+    ...(o.key !== undefined ? { key: o.key as string } : {}),
+    ...(o.causal !== undefined ? { causal: [(o.causal as unknown[])[0], (o.causal as unknown[])[1]] as [string, number] } : {}),
+    ...(o.ref !== undefined
+      ? { ref: [(o.ref as unknown[])[0], (o.ref as unknown[])[1], (o.ref as unknown[])[2]] as [string, string, number] }
+      : {}),
+    payload: o.payload,
+    chain: o.chain,
+  };
   assertEntrySize(entry, constants);
   return entry;
 }
