@@ -38,7 +38,8 @@
     "test:watch": "vitest",
     "gen:vectors": "node tools/gen-vectors.mjs",
     "gen:types": "node tools/gen-types.mjs",
-    "check": "npm run gen:types && tsc --noEmit --strict --skipLibCheck types.d.ts && tsc --noEmit && vitest run && npm run build && tsc -p fixture"
+    "check": "npm run gen:types && tsc --noEmit --strict --skipLibCheck types.d.ts && tsc --noEmit && vitest run && npm run build && tsc -p fixture",
+    "e2e:browser": "npm run build && npx esbuild e2e-browser/main.src.js --bundle --format=esm --platform=browser --outfile=e2e-browser/main.js '--external:/@sqlite.org/*' && node e2e-browser/server.mjs 8971"
   },
   "dependencies": {
     "@noble/hashes": "^1.4.0",
