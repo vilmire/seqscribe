@@ -103,7 +103,7 @@ Seed-derived scenario matrix over: topology (pair / star / mesh-K / two-cluster 
 1. **vectors**: replay `vectors/vectors.json` (cheapest gate, runs first — see [test-vectors.md](test-vectors.md)).
 2. **types**: generate `types.d.ts` per §14 rule; typecheck + fixture-package import.
 3. **fixed seeds**: the permanent regression corpus (`harness/seeds.json` — failing seeds join forever, per §19). Each entry records seed + scenario name + the property it once broke.
-4. **fresh seeds**: N new random seeds per run (N sized to CI budget); failures are minimized (greedy schedule-slicing: drop fault windows / workload segments while the failure reproduces) before joining the corpus.
+4. **fresh seeds**: N new random seeds per run (N sized to CI budget); failures are minimized before joining the corpus — implemented as `node tools/minimize-seed.mjs <seed> [--scenario <name>]` (greedy schedule-slicing per `harness/minimize.ts`: drop fault windows / workload segments, shrink survivors by halves, reduce node count — while the same property still fails; emits a seeds.json-shaped descriptor on stdout).
 5. **P7 gate** + the separate non-gating soak profile (§19 note 10), reported as a trend metric.
 
 ## 11. Open items for milestone ①
