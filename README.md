@@ -23,4 +23,4 @@ Extracted from and dogfooded by [ADHDev](https://adhf.dev). Maintained for our n
 
 ## License
 
-[MIT](LICENSE)
+[FSL-1.1-Apache-2.0](LICENSE) — the Functional Source License: embed it in anything, build products and internal systems on it freely; the only restricted use is offering seqscribe itself as a competing commercial product or service. Each release automatically becomes Apache-2.0 two years after publication. (The pre-implementation npm placeholder 0.0.1 was published under MIT and remains so; every version from the implementation onward is FSL.)

@@ -2,7 +2,7 @@
   "name": "seqscribe",
   "version": "0.1.0-dev.0",
   "description": "Subscribe to sequences — writer-owned append-only log sync for SQLite. Implementation of SPEC v3.3; not yet released.",
-  "license": "MIT",
+  "license": "FSL-1.1-Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/vilmire/seqscribe.git"
