@@ -1,3 +1,11 @@
+// Public API surface. §14 defines the normative contract; everything exported
+// here is either §14 surface, a spec-defined pure helper (§3 HLC, §4 encoding,
+// §1 charters), or the shipped reference tier (transports, adapters, host
+// sugar). Internal machinery (Store, LogCore, Session, SyncEngine, the hubs,
+// wire message codecs) is deliberately NOT re-exported: tests and the harness
+// import those from their modules directly, and keeping them off the package
+// surface is what lets them change without a semver event. `coreOf` is the
+// one sanctioned escape hatch (unstable — see node.ts).
 export * from "./types.js";
 export { SeqscribeError } from "./errors.js";
 export { DEFAULT_CONSTANTS, resolveConstants } from "./constants.js";
@@ -34,22 +42,9 @@ export {
   TOPIC_RE,
   WRITER_RE,
 } from "./codec.js";
-export { validatePolicy, conflictPolicyFor, TopicRegistry } from "./topics.js";
-export { Store, type WriterRow, type SealReason } from "./store.js";
-export { LogCore, type ApplyResult, type LogCoreOpts, type AppliedHook } from "./log.js";
-export { ConsumerHub } from "./consume.js";
-export { ViewHub, type ViewChange } from "./views.js";
-export { FinalityHub } from "./finality.js";
-export { Session, PROTO_MIN, PROTO_MAX, type SessionState } from "./session.js";
-export { SyncEngine } from "./sync.js";
-export * from "./messages.js";
-export { SubHub, b64encode, b64decode } from "./subs.js";
-export { SnapshotHub } from "./snapshot.js";
-export { RegisterHub } from "./register.js";
-export { DirectiveHub } from "./directives.js";
-export { BeaconHub, httpBeaconTransport, beaconFetchHandler, type FetchRequestLike } from "./beacon.js";
-export { ArchiveHub } from "./archive.js";
+export { validatePolicy, conflictPolicyFor } from "./topics.js";
 export { exportTopic, importTopic } from "./export.js";
+export { httpBeaconTransport, beaconFetchHandler, type FetchRequestLike } from "./beacon.js";
 export { webSocketChannel, dataChannelChannel, type WebSocketLike } from "./ws.js";
 export {
   betterSqlite3Handle,

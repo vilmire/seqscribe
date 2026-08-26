@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { conflictPolicyFor, SeqscribeError, TopicRegistry } from "../src/index.js";
+import { conflictPolicyFor, SeqscribeError } from "../src/index.js";
+import { TopicRegistry } from "../src/topics.js";
 import type { TopicPolicy } from "../src/index.js";
 
 const appendFull: TopicPolicy = {

@@ -6,7 +6,9 @@
 import { describe, expect, it } from "vitest";
 import { Scheduler } from "../harness/scheduler.js";
 import { memoryHandle } from "../harness/sqlite.js";
-import { b64encode, createSeqscribe, parseMsg, resolveConstants, serializeMsg } from "../src/index.js";
+import { createSeqscribe, resolveConstants } from "../src/index.js";
+import { parseMsg, serializeMsg, type WireMsg } from "../src/messages.js";
+import { b64encode } from "../src/subs.js";
 import type {
   Anomaly,
   Channel,
@@ -14,7 +16,6 @@ import type {
   PeerHandle,
   SeqscribeNode,
   TopicPolicy,
-  WireMsg,
 } from "../src/index.js";
 
 const T = "t.notes";
