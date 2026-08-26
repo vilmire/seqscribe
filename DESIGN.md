@@ -67,7 +67,7 @@ Methodology lesson (naming & surveying): category-name searches do not substitut
 
 > ⚠️ The draft sketch in this section was superseded by decisions 8 (HLC total order) and 9 (causal attachment) — **the precise definition is SPEC §1–§2**. Gist: LogEntry = {topic, writer, seq, **hlc**, kind, key?, causal?, payload (JSON only, ≤64KB)}. Order within a writer is seq; the cross-writer total order is (hlc, writer, seq).
 
-- **Snapshots/compaction**: see SPEC §10 (v2: topic-level total-order cuts). The (writerId, seq) namespace is permanently reserved (no reuse).
+- **Snapshots/compaction**: see SPEC §7.7–7.8 (v2: topic-level total-order cuts). The (writerId, seq) namespace is permanently reserved (no reuse).
 - **Derived views**: reducer + SQLite materialization helper; views are always `rebuild()`-able. FTS indexes are a kind of view.
 - Physical log format belongs to the storage adapter (Node: SQLite tables; JSONL as an import/export compatibility path for the existing mesh ledger).
 
@@ -187,7 +187,7 @@ node.onConflict("config.settings", async (c) => {
 
 ## 6. API sketch
 
-> ⚠️ Superseded — **the complete API is SPEC §13** (async append, register helpers that stamp causal, full view ABI, verifyTakeover injection, etc.). Kept here only as historical shape.
+> ⚠️ Superseded — **the complete API is SPEC §14** (async append, register helpers that stamp causal, full view ABI, verifyTakeover injection, etc.). Kept here only as historical shape.
 
 ## 7. Non-goals (v1, codified)
 

@@ -1,0 +1,28 @@
+# CI shape per docs/harness.md §10, mandated by SPEC §14 (types.d.ts gate) and
+# §19 ("CI: fixed-seed regression set + fresh random seeds").
+#
+# `npm run check` = gen:types → typecheck types.d.ts → tsc → vitest run
+# (vectors, fixed-seed corpus, directed tests, P7 gate) → build → fixture
+# typecheck. FRESH_SEEDS adds N random-seed explorations to properties.test.ts;
+# a failing fresh seed prints its seed value — add it to harness/seeds.json
+# (per §19, failing seeds join the corpus permanently).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+        env:
+          FRESH_SEEDS: "10"

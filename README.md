@@ -4,7 +4,7 @@
 
 **Subscribe to sequences** — writer-owned append-only log sync for SQLite, over any network you bring Logs converge into SQLite views. Embeddable, transport-agnostic (bring your own channel — WebRTC DataChannel, WebSocket, anything bidirectional), no consensus, no master, partition-tolerant by construction.
 
-**Status: implementation complete through the pre-integration tier** (SPEC v3.4, 2026-08-26). All five milestones implemented; the deterministic harness passes the scaled acceptance properties (P1/P2/P3/P5) **and the full §19 P7 catch-up gate** (100 nodes, 60 s partition, 1% loss → converged at heal+40 s — the run that surfaced the four v3.4 amendments, evidence in [docs/proposals-v3.4.md](docs/proposals-v3.4.md)). Real-infrastructure e2e (actual WebSockets, file-backed SQLite, restart persistence) is green; reference WS transport, better-sqlite3 adapter, and HTTP beacon client ship in-tree. See [docs/implementation.md](docs/implementation.md) for exact coverage. Next phase: ADHDev integration; public release follows production validation.
+**Status: implementation complete through the pre-integration tier** (SPEC v3.4, 2026-08-26). All five milestones implemented; the deterministic harness passes the scaled acceptance properties (P1/P2/P3/P5) **and the full §19 P7 catch-up gate** (100 nodes, 60 s partition, 1% loss → converges within the ≤120 s gate; heal+40–50 s observed across runs — the gate is the claim, per-run timing varies. The first passing run surfaced the four v3.4 amendments, evidence in [docs/proposals-v3.4.md](docs/proposals-v3.4.md)). Real-infrastructure e2e (actual WebSockets, file-backed SQLite, restart persistence) is green; reference WS transport, better-sqlite3 adapter, and HTTP beacon client ship in-tree. See [docs/implementation.md](docs/implementation.md) for exact coverage. ADHDev integration is underway (Phase 0 findings already folded back — see [docs/proposals-v3.5.md](docs/proposals-v3.5.md)); a versioned release follows production validation.
 
 The design contract:
 
@@ -17,7 +17,9 @@ Companion documents (non-normative):
 - [docs/host-guide.md](docs/host-guide.md) — the host's contract obligations: identity issuance, authority operations, fork adjudication runbook, backup truth table, anomaly triage
 - [docs/harness.md](docs/harness.md) — simulation harness design: virtual time, fault model, quiescence, P1–P10 checker algorithms, CI shape
 - [docs/implementation.md](docs/implementation.md) — module decomposition mapped to the §19 milestones
-- [docs/proposals-v3.3.md](docs/proposals-v3.3.md) — proposed SPEC amendments surfaced by the vector/harness work (pending stamp)
+- [docs/proposals-v3.3.md](docs/proposals-v3.3.md) — SPEC amendments surfaced by the vector/harness work (ratified into v3.3)
+- [docs/proposals-v3.4.md](docs/proposals-v3.4.md) — amendments surfaced by the first failing P7 runs (ratified into v3.4)
+- [docs/proposals-v3.5.md](docs/proposals-v3.5.md) — spec-adjacent additions from integration-readiness and ADHDev Phase 0 (pending stamp)
 
 Extracted from and dogfooded by [ADHDev](https://adhf.dev). Maintained for our needs first.
 
