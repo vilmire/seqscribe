@@ -45,11 +45,13 @@
     "canonicalize": "^2.0.0"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "better-sqlite3": "^11.0.0",
     "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "better-sqlite3": "^11.0.0",
     "typescript": "^5.5.0",
-    "vitest": "^2.0.0"
+    "vitest": "^2.0.0",
+    "ws": "^8.21.3"
   },
   "bin": {
     "seqscribe": "./bin/seqscribe.mjs"

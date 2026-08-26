@@ -110,3 +110,30 @@ export class BeaconHub {
       });
   }
 }
+
+// Reference HTTP transport for the §14 beacon wire:
+//   POST /v1/a/{account}/vectors   (body: BeaconReport, bearer auth)
+//   GET  /v1/a/{account}/vectors → BeaconReport[]
+export function httpBeaconTransport(
+  baseUrl: string,
+  account: string,
+  token?: string,
+): BeaconTransport {
+  const url = `${baseUrl.replace(/\/$/, "")}/v1/a/${encodeURIComponent(account)}/vectors`;
+  const f = (globalThis as unknown as {
+    fetch: (u: string, init?: object) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+  }).fetch;
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (token !== undefined) headers.authorization = `Bearer ${token}`;
+  return {
+    async put(body: BeaconReport): Promise<void> {
+      const res = await f(url, { method: "POST", headers, body: JSON.stringify(body) });
+      if (!res.ok) throw new Error(`beacon PUT failed: ${res.status}`);
+    },
+    async get(): Promise<BeaconReport[]> {
+      const res = await f(url, { method: "GET", headers });
+      if (!res.ok) throw new Error(`beacon GET failed: ${res.status}`);
+      return (await res.json()) as BeaconReport[];
+    },
+  };
+}

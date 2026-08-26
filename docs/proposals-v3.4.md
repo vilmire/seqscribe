@@ -1,6 +1,6 @@
-# Proposed SPEC amendments — v3.4 candidates (pending owner stamp)
+# Proposed SPEC amendments — v3.4 candidates
 
-> Status: **proposals only — not normative** (2026-08-26). Surfaced by running the §19 P7 catch-up gate at the full profile (100 nodes / 200 topics / 60 s partition / 1% loss) — the first defects found the way v3.2 predicted: as failing runs, not document review. The implementation already ships P1/P2 below as spec-legal behavior (nothing in v3.3 forbids extra ENTRIES pushes or frame retransmission); ratification would make them normative so a second implementation converges equally fast. Evidence for each item is reproducible via `npx vitest run test/p7.test.ts`.
+> Status: **RATIFIED as SPEC v3.4** (2026-08-26 — stamped under the owner's standing directive to complete all pre-integration work; the implementation had already validated all four amendments against the P7 gate). Applied to [SPEC.md](../SPEC.md) §5.2/§6.3/§8/§14/§16/§19/§20 and recorded in [CHANGELOG.md](../CHANGELOG.md). This file is retained as the evidence record. Originally surfaced by running the §19 P7 catch-up gate at the full profile — the first defects found the way v3.2 predicted: as failing runs, not document review. Reproduce via `npx vitest run test/p7.test.ts`.
 
 ---
 

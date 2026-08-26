@@ -152,9 +152,15 @@ async function cmdInspect([path]) {
 }
 
 // Reference beacon (§14 wire): a content-free vector board, tens of lines.
+// Bearer auth: set SEQSCRIBE_BEACON_TOKEN to require `Authorization: Bearer <t>`.
 function cmdBeacon([port]) {
+  const token = process.env.SEQSCRIBE_BEACON_TOKEN;
   const board = new Map(); // account → node → report
   const server = createServer((req, res) => {
+    if (token && req.headers.authorization !== `Bearer ${token}`) {
+      res.writeHead(401).end();
+      return;
+    }
     const m = /^\/v1\/a\/([^/]+)\/vectors$/.exec(req.url ?? "");
     if (!m) {
       res.writeHead(404).end();
@@ -187,7 +193,10 @@ function cmdBeacon([port]) {
     res.writeHead(405).end();
   });
   const p = Number(port ?? 8787);
-  server.listen(p, () => process.stderr.write(`seqscribe beacon on :${p}\n`));
+  server.listen(p, () => {
+    const actual = server.address()?.port ?? p;
+    process.stderr.write(`seqscribe beacon on :${actual}\n`);
+  });
 }
 
 switch (cmd) {

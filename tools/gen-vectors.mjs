@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Test-vector generator for the seqscribe SPEC (v3.2).
+// Test-vector generator for the seqscribe SPEC (hashing rules stable since v3.2).
 // Regenerate with:  node tools/gen-vectors.mjs
 // Writes vectors/vectors.json and prints a summary.
 //
@@ -212,7 +212,7 @@ const schemaHashVectors = policyCases.map((c) => ({
 
 const out = {
   seqscribe: "vectors/v1",
-  spec: "v3.2",
+  spec: "v3.2+",
   generator: "tools/gen-vectors.mjs",
   note: "Sections 1-6 follow normative SPEC text; section 7 (topicSchemaHash) follows the PROPOSED normalization in docs/proposals-v3.3.md and is not yet ratified.",
   jcs: jcsVectors,

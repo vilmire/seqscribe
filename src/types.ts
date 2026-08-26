@@ -1,4 +1,4 @@
-// Public type surface — mirrors SPEC v3.3 normative ts blocks (§1, §2, §7.2, §7.7,
+// Public type surface — mirrors SPEC v3.4 normative ts blocks (§1, §2, §7.2, §7.7,
 // §9, §11.6, §13, §14). CI cross-checks against types.d.ts generated from the SPEC.
 
 export type JsonPrimitive = string | number | boolean | null;
@@ -105,8 +105,6 @@ export interface Constants {
   PENDING_CAP: number;
   SUB_DELTA_RETAIN: number;
   EAGER_PUSH_K: number;
-  RELAY_FANOUT: number;
-  RELAY_WINDOW_MS: number;
   ANTI_ENTROPY_MS: number;
   BEACON_DEBOUNCE_MS: number;
   HLC_EPSILON_MS: number;
