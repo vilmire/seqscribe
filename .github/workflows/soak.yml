@@ -1,0 +1,23 @@
+# The §19 note-10 sustained-load soak profile, reported as a trend metric per
+# docs/harness.md §10 (stage 5) — deliberately a separate non-gating workflow:
+# a soak regression should be seen weekly, not block every push.
+name: soak
+on:
+  schedule:
+    - cron: "0 3 * * 1" # weekly, Monday 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx vitest run test/p7.test.ts
+        env:
+          SOAK: "1"
