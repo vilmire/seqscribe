@@ -68,8 +68,20 @@ export class ViewHub {
   private readonly views = new Map<string, Instance>();
   private readonly byTopic = new Map<Topic, Instance[]>();
   private readonly changeListeners = new Set<(c: ViewChange) => void>();
+  private readonly scheduleTimers = new Set<unknown>();
+  private closed = false;
 
   constructor(private readonly deps: ViewHubDeps) {}
+
+  // §14 close quiescence: cancel pending materialize passes and refuse new
+  // ones — nothing may touch the store once the owner lock releases. The
+  // deferred fold is recoverable on next open (checkpoints, lastRowid floors).
+  close(): void {
+    this.closed = true;
+    for (const h of this.scheduleTimers) this.deps.timers.clearTimeout(h);
+    this.scheduleTimers.clear();
+    for (const inst of this.views.values()) inst.scheduled = false;
+  }
 
   onViewChange(cb: (c: ViewChange) => void): () => void {
     this.changeListeners.add(cb);
@@ -295,12 +307,14 @@ export class ViewHub {
   }
 
   private schedule(inst: Instance): void {
-    if (inst.scheduled || inst.faulted) return;
+    if (this.closed || inst.scheduled || inst.faulted) return;
     inst.scheduled = true;
-    this.deps.timers.setTimeout(() => {
+    const h = this.deps.timers.setTimeout(() => {
+      this.scheduleTimers.delete(h);
       inst.scheduled = false;
       this.materialize(inst);
     }, 0);
+    this.scheduleTimers.add(h);
   }
 
   private restore(inst: Instance): void {
@@ -316,7 +330,7 @@ export class ViewHub {
   }
 
   private materialize(inst: Instance): void {
-    if (inst.faulted || inst.materializing) return;
+    if (this.closed || inst.faulted || inst.materializing) return;
     inst.materializing = true;
     try {
       for (;;) {

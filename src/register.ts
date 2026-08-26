@@ -105,8 +105,26 @@ export class RegisterHub {
   private readonly scopeTails = new Map<string, [WriterId, number]>();
   private readonly scheduled = new Set<Topic>();
   private readonly materializing = new Set<Topic>();
+  private readonly materializeTimers = new Set<unknown>();
+  private closed = false;
 
-  constructor(private readonly deps: RegisterHubDeps) {}
+  constructor(private readonly deps: RegisterHubDeps) {
+    // §11.2 + §8 rollback hygiene: causalProvider advances scopeTails inside
+    // the commit transaction (the seq is assigned there). If the batch aborts,
+    // those tails name seqs that never committed and the next write would
+    // stamp a self-referential causal edge. Snapshot-and-restore (rather than
+    // deferring the mutation) because later appends in the same batch must see
+    // earlier tails for intra-batch causal chaining.
+    deps.core.addTxnGuard({
+      snapshot: () => {
+        const saved = new Map(this.scopeTails);
+        return () => {
+          this.scopeTails.clear();
+          for (const [scope, tail] of saved) this.scopeTails.set(scope, tail);
+        };
+      },
+    });
+  }
 
   // ---- public API ----
 
@@ -209,7 +227,7 @@ export class RegisterHub {
       for (const e of entries) {
         const o = orderOf(e);
         if (orderCompare(o, ord) > 0) break outer;
-        await this.fold(topic, st, e, []);
+        await this.fold(topic, st, e, [], "replay");
         cursor = o;
       }
     }
@@ -306,13 +324,27 @@ export class RegisterHub {
   }
 
   notifyApplied(topic: Topic): void {
+    if (this.closed) return;
     if (this.deps.topics.get(topic).policy.kind !== "register") return;
     if (this.scheduled.has(topic)) return;
     this.scheduled.add(topic);
-    this.deps.timers.setTimeout(() => {
+    const h = this.deps.timers.setTimeout(() => {
+      this.materializeTimers.delete(h);
       this.scheduled.delete(topic);
       void this.materialize(topic);
     }, 0);
+    this.materializeTimers.add(h);
+  }
+
+  // §14 close quiescence: cancel scheduled materialize passes and stop
+  // in-flight ones at their next check — nothing may touch the store once the
+  // owner lock releases. Deferred folds are recoverable on next open
+  // (lastRowid floors, persisted bases).
+  close(): void {
+    this.closed = true;
+    for (const h of this.materializeTimers) this.deps.timers.clearTimeout(h);
+    this.materializeTimers.clear();
+    this.scheduled.clear();
   }
 
   // ---- write path (§11.2 race-safe causal stamping) ----
@@ -387,6 +419,7 @@ export class RegisterHub {
   }
 
   private async materialize(topic: Topic): Promise<void> {
+    if (this.closed) return;
     if (this.materializing.has(topic)) {
       this.notifyApplied(topic); // rerun after the current pass
       return;
@@ -396,6 +429,7 @@ export class RegisterHub {
       const st = this.topicState(topic);
       const events: (() => void | Promise<void>)[] = [];
       for (;;) {
+        if (this.closed) return; // §14 close quiescence: stop before the next store read
         const rows = this.deps.store.entriesForTopicFromRowid(topic, st.lastRowid, 500);
         if (rows.length === 0) break;
         const sorted = rows.map((r) => r.entry).sort((a, b) => orderCompare(orderOf(a), orderOf(b)));
@@ -413,33 +447,44 @@ export class RegisterHub {
           this.surfacedConflicts.clear();
           let cursor: Order | null = st.ord;
           for (;;) {
+            if (this.closed) return;
             const batch = this.deps.store.entriesAfterOrder(topic, cursor, 500);
             if (batch.length === 0) break;
-            for (const e of batch) await this.fold(topic, st, e, events);
+            for (const e of batch) await this.fold(topic, st, e, events, "live");
             cursor = st.ord;
           }
           st.lastRowid = this.deps.store.maxRowid(topic);
           break;
         }
-        for (const e of sorted) await this.fold(topic, st, e, events);
+        for (const e of sorted) await this.fold(topic, st, e, events, "live");
         st.lastRowid = lastRowid;
       }
+      if (this.closed) return;
       this.rewriteTable(topic, st);
-      for (const fn of events) await fn();
+      for (const fn of events) {
+        if (this.closed) return;
+        await fn();
+      }
       for (const cb of this.changeListeners) cb(topic);
     } finally {
       this.materializing.delete(topic);
     }
   }
 
+  // mode threads through every fold call so snapshot state and live state stay
+  // products of the same function (docs/implementation.md): "live" is the
+  // materialize path with its side effects; "replay" is a historical re-fold
+  // (stateAt, §7.7) that must not touch live scope tails nor re-emit anomalies
+  // for entries the live fold already surfaced.
   private async fold(
     topic: Topic,
     st: TopicState,
     e: LogEntry,
     events: (() => void | Promise<void>)[],
+    mode: "live" | "replay",
   ): Promise<void> {
     st.ord = orderOf(e);
-    if (e.writer === this.deps.writerId) {
+    if (mode === "live" && e.writer === this.deps.writerId) {
       // §11.2: the "own uncommitted tail" shrinks as own writes materialize —
       // once folded, causal stamping falls back to the materialized winner.
       // Own entries appear in seq order within the total order (hlc monotonic),
@@ -481,7 +526,7 @@ export class RegisterHub {
       }
       case "chown": {
         if (ks.owner !== undefined && ks.owner !== e.writer) {
-          this.violation(e);
+          if (mode === "live") this.violation(e);
           return;
         }
         ks.owner = String(payload.newOwner ?? "");
@@ -489,7 +534,7 @@ export class RegisterHub {
       }
       case "chown-takeover": {
         if (!(await this.verifyTakeover(e))) {
-          this.deps.emitAnomaly({ kind: "takeover_invalid", entry: e });
+          if (mode === "live") this.deps.emitAnomaly({ kind: "takeover_invalid", entry: e });
           return;
         }
         ks.owner = String(payload.newOwner ?? "");
@@ -497,7 +542,7 @@ export class RegisterHub {
       }
       case "set":
       case "del": {
-        if (policy === "owned" && !this.ownedWriteAllowed(ks, e)) return;
+        if (policy === "owned" && !this.ownedWriteAllowed(ks, e, mode)) return;
         // §11.5 mirror rule: set on a member key replaces the whole member map
         if (e.kind === "set" && !ks.scalar) {
           ks.members.clear();
@@ -523,7 +568,7 @@ export class RegisterHub {
       }
       case "add":
       case "remove": {
-        if (policy === "owned" && !this.ownedWriteAllowed(ks, e)) return;
+        if (policy === "owned" && !this.ownedWriteAllowed(ks, e, mode)) return;
         // mirror rule: a member op on a scalar-valued key clears the scalar
         if (ks.scalar && ks.value !== undefined) {
           ks.value = undefined;
@@ -634,9 +679,11 @@ export class RegisterHub {
     }
   }
 
-  private ownedWriteAllowed(ks: KeyState, e: LogEntry): boolean {
+  private ownedWriteAllowed(ks: KeyState, e: LogEntry, mode: "live" | "replay"): boolean {
     if (ks.owner === undefined || ks.owner === e.writer) return true;
-    this.violation(e);
+    // replay skips the annotation/anomaly — the live fold already surfaced
+    // this violation; the fold's *decision* (write refused) stays identical
+    if (mode === "live") this.violation(e);
     return false;
   }
 

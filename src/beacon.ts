@@ -46,6 +46,18 @@ export class BeaconHub {
     };
   }
 
+  // §14 close quiescence: a started beacon's debounce timer reads
+  // core.vectors() when it fires, so node.close() must cancel it like every
+  // other hub timer rather than rely on the host calling the handle's stop().
+  close(): void {
+    this.stopped = true;
+    if (this.debounceTimer !== null) {
+      this.deps.timers.clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+    this.transport = null;
+  }
+
   // called from the applied fan-out — 5 s debounce after append (§5.7)
   notifyApplied(): void {
     if (!this.transport || this.stopped || this.debounceTimer !== null) return;

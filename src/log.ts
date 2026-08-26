@@ -132,6 +132,14 @@ export class LogCore {
   private queue: QueueItem[] = [];
   private flushTimer: unknown = null;
   private closed = false;
+  // §8 rollback hygiene: side state that other hubs advance inside the commit
+  // transaction (e.g. the register hub's causal scope tails, §11.2) registers
+  // a guard here — snapshot() captures pre-txn state and returns the restore
+  // to run when the transaction aborts.
+  private readonly txnGuards: { snapshot(): () => void }[] = [];
+  // per-flush copy-on-write journal for ring tails touched by persist() —
+  // ring pushes are in-memory only (§14) and would otherwise survive an abort
+  private ringUndo: Map<Topic, LogEntry[] | undefined> | null = null;
 
   constructor(opts: LogCoreOpts) {
     this.store = opts.store;
@@ -197,6 +205,13 @@ export class LogCore {
 
   setOnApplied(hook: AppliedHook | undefined): void {
     this.onApplied = hook;
+  }
+
+  // Internal wiring (not public API): hubs whose in-memory state is mutated
+  // inside the commit transaction register here so a failed batch restores it
+  // together with heads/certs/vectors (§8 rollback hygiene).
+  addTxnGuard(guard: { snapshot(): () => void }): void {
+    this.txnGuards.push(guard);
   }
 
   // Certificate application is serialized through the append queue (§8):
@@ -346,6 +361,23 @@ export class LogCore {
   async close(): Promise<void> {
     await this.flushNow();
     this.closed = true;
+    // settle callbacks resolved during the final flush can race close and
+    // enqueue more work on their microtasks — cancel the straggler flush and
+    // reject the items: a closed core must neither commit nor leave callers
+    // hanging (§14 close quiescence).
+    if (this.flushTimer !== null) {
+      this.timers.clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.rejectQueueClosed();
+  }
+
+  private rejectQueueClosed(): void {
+    if (this.queue.length === 0) return;
+    const batch = this.queue;
+    this.queue = [];
+    const e = new SeqscribeError("ERR_MISUSE", "node is closed");
+    for (const item of batch) item.reject(e);
   }
 
   private push(item: QueueItem): void {
@@ -360,6 +392,12 @@ export class LogCore {
 
   private flush(): void {
     this.flushTimer = null;
+    if (this.closed) {
+      // §14 close quiescence: a straggler flush after close must not touch
+      // the store — reject rather than commit or hang.
+      this.rejectQueueClosed();
+      return;
+    }
     const batch = this.queue;
     if (batch.length === 0) return;
     this.queue = [];
@@ -367,6 +405,18 @@ export class LogCore {
     const settle: (() => void)[] = [];
     const applied: { entry: LogEntry; rowid: number | null; via: string | undefined }[] = [];
     const anomalies: Anomaly[] = [];
+
+    // §8 rollback hygiene: heads/certs/vectors reload lazily from the store,
+    // but the HLC, recovery targets, ring tails and hub side state (register
+    // scope tails, §11.2) have no durable source of truth to reload from —
+    // snapshot them up front so an aborted commit can restore them. Snapshots
+    // (not deferral) because later items in the same batch must observe
+    // earlier items' side state (e.g. intra-batch causal chaining, recovery
+    // targets set by a directive and read by a following external ingest).
+    const hlcBefore = this.hlcState;
+    const recoveriesBefore = new Map(this.recoveries);
+    const guardRestores = this.txnGuards.map((g) => g.snapshot());
+    this.ringUndo = new Map();
 
     try {
       this.store.transaction(() => {
@@ -381,11 +431,23 @@ export class LogCore {
         this.store.metaSet(HLC_META_KEY, JSON.stringify(this.hlcState));
       });
     } catch (err) {
-      // A failed transaction rolls everything back — reject the whole batch and
-      // invalidate caches that may have advanced inside the aborted txn.
+      // A failed transaction rolls everything back — reject the whole batch,
+      // invalidate the store-backed caches, and restore every piece of side
+      // state that advanced inside the aborted txn (otherwise e.g. a register
+      // scope tail names a seq that never committed and the next write stamps
+      // a self-referential causal edge, §11.2).
       this.heads.clear();
       this.certs.clear();
       this.vectorsCache = null;
+      this.hlcState = hlcBefore;
+      this.recoveries.clear();
+      for (const [k, v] of recoveriesBefore) this.recoveries.set(k, v);
+      for (const [topic, prev] of this.ringUndo) {
+        if (prev === undefined) this.rings.delete(topic);
+        else this.rings.set(topic, prev);
+      }
+      this.ringUndo = null;
+      for (const restore of guardRestores) restore();
       const e =
         err instanceof SeqscribeError
           ? err
@@ -393,6 +455,7 @@ export class LogCore {
       for (const item of batch) item.reject(e);
       return;
     }
+    this.ringUndo = null;
 
     for (const fn of settle) fn();
     for (const a of anomalies) this.emitAnomaly(a);
@@ -808,7 +871,11 @@ export class LogCore {
     const policy = this.topics.get(e.topic).policy;
     if (policy.retention.mode === "full") return this.store.insertEntry(e);
     if (policy.retention.mode === "ring") {
-      const ring = this.rings.get(e.topic) ?? [];
+      const prev = this.rings.get(e.topic);
+      // journal the pre-txn tail once per flush — restored if the commit aborts
+      if (this.ringUndo && !this.ringUndo.has(e.topic))
+        this.ringUndo.set(e.topic, prev ? [...prev] : undefined);
+      const ring = prev ?? [];
       ring.push(e);
       const size = (policy.retention as { size: number }).size;
       if (ring.length > size) ring.splice(0, ring.length - size);

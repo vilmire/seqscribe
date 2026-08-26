@@ -253,6 +253,15 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
       closed = true;
       sync.closeAll();
       await core.close();
+      // §14 close quiescence: the final flush above fans out through
+      // onApplied and schedules hub timers — close the hubs AFTER the core so
+      // those timers are cancelled and nothing touches the store once the
+      // owner lock releases. The deferred work is recoverable on next open
+      // (cursors, checkpoints, lastRowid floors).
+      consumers.close();
+      views.close();
+      registers.close();
+      beaconHub.close();
       store.close();
     },
   };
