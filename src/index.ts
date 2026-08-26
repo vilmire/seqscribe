@@ -47,9 +47,28 @@ export { SubHub, b64encode, b64decode } from "./subs.js";
 export { SnapshotHub } from "./snapshot.js";
 export { RegisterHub } from "./register.js";
 export { DirectiveHub } from "./directives.js";
-export { BeaconHub, httpBeaconTransport } from "./beacon.js";
+export { BeaconHub, httpBeaconTransport, beaconFetchHandler, type FetchRequestLike } from "./beacon.js";
 export { ArchiveHub } from "./archive.js";
 export { exportTopic, importTopic } from "./export.js";
 export { webSocketChannel, type WebSocketLike } from "./ws.js";
-export { betterSqlite3Handle, type BetterSqlite3Like } from "./adapters.js";
-export { createSeqscribe, coreOf } from "./node.js";
+export {
+  betterSqlite3Handle,
+  sqliteWasmHandle,
+  durableObjectSqlHandle,
+  type BetterSqlite3Like,
+  type LockDbLike,
+  type SqliteWasmDbLike,
+  type DurableObjectSqlLike,
+} from "./adapters.js";
+export {
+  hmacAuthority,
+  startFinalityLoop,
+  manageReconnect,
+  loadOrCreateWriterId,
+  migrateLegacyJsonl,
+  type HmacAuthority,
+  type HmacAuthorityOpts,
+  type FinalityLoopHandle,
+  type ReconnectHandle,
+} from "./host.js";
+export { createSeqscribe, coreOf, type SeqscribeNodeExt, type NodeStats } from "./node.js";

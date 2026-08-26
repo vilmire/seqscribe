@@ -14,7 +14,15 @@ export interface BetterSqlite3Like {
   transaction<T>(fn: () => T): () => T;
 }
 
-export function betterSqlite3Handle(db: BetterSqlite3Like): SqliteHandle {
+// Optional second connection used purely as a cross-process mutex: holding
+// BEGIN EXCLUSIVE on `<db>.lock` takes an OS-level file lock that dies with
+// the process — a crashed owner never wedges the DB (§8 single-process MUST).
+export interface LockDbLike {
+  exec(sql: string): unknown;
+  close(): void;
+}
+
+export function betterSqlite3Handle(db: BetterSqlite3Like, lockDb?: LockDbLike): SqliteHandle {
   let owned = false;
   return {
     run(sql, params = []) {
@@ -35,10 +43,144 @@ export function betterSqlite3Handle(db: BetterSqlite3Like): SqliteHandle {
     transaction(fn) {
       return db.transaction(fn)();
     },
-    // §8 single-process ownership: in-process reentry guard; cross-process
-    // exclusion comes from SQLite's own locking under WAL
     acquireOwnerLock() {
       if (owned) throw new Error("DB already owned by this process");
+      if (lockDb) {
+        try {
+          lockDb.exec("BEGIN EXCLUSIVE");
+        } catch {
+          throw new Error("DB owned by another process (lock file held)");
+        }
+      }
+      owned = true;
+    },
+    releaseOwnerLock() {
+      if (owned && lockDb) {
+        try {
+          lockDb.exec("ROLLBACK");
+        } catch {
+          // lock connection already gone
+        }
+      }
+      owned = false;
+    },
+  };
+}
+
+// ---- SQLite WASM (browser) ----
+//
+// Adapter for the official @sqlite.org/sqlite-wasm oo1.DB API. Synchronous, so
+// in a browser it must run in a worker with OPFS sync access handles (or an
+// in-memory DB for pure Tier-2 subscribers). Transactions are managed with
+// explicit BEGIN/SAVEPOINT so nesting behaves like the better-sqlite3 adapter.
+
+export interface SqliteWasmDbLike {
+  exec(opts: { sql: string; bind?: unknown[] }): unknown;
+  selectObjects(sql: string, bind?: unknown[]): Record<string, unknown>[];
+  selectValue(sql: string, bind?: unknown[]): unknown;
+}
+
+const READER_RE = /^\s*(select|pragma|with|explain)\b/i;
+
+export function sqliteWasmHandle(db: SqliteWasmDbLike): SqliteHandle {
+  let owned = false;
+  let depth = 0;
+  return {
+    run(sql, params = []) {
+      if (READER_RE.test(sql)) {
+        db.selectObjects(sql, params);
+        return { changes: 0, lastInsertRowid: 0 };
+      }
+      db.exec({ sql, bind: params });
+      const rowid = db.selectValue("SELECT last_insert_rowid()");
+      return { changes: 0, lastInsertRowid: Number(rowid ?? 0) };
+    },
+    get<T>(sql: string, params: unknown[] = []) {
+      return db.selectObjects(sql, params)[0] as T | undefined;
+    },
+    all<T>(sql: string, params: unknown[] = []) {
+      return db.selectObjects(sql, params) as T[];
+    },
+    transaction<T>(fn: () => T): T {
+      const name = `sq_sp_${depth}`;
+      db.exec({ sql: depth === 0 ? "BEGIN" : `SAVEPOINT ${name}` });
+      depth++;
+      try {
+        const out = fn();
+        depth--;
+        db.exec({ sql: depth === 0 ? "COMMIT" : `RELEASE ${name}` });
+        return out;
+      } catch (e) {
+        depth--;
+        db.exec({ sql: depth === 0 ? "ROLLBACK" : `ROLLBACK TO ${name}; RELEASE ${name}` });
+        throw e;
+      }
+    },
+    // browsers: one tab/worker owns the DB; OPFS sync access handles already
+    // enforce single-connection exclusivity at the file layer
+    acquireOwnerLock() {
+      if (owned) throw new Error("DB already owned");
+      owned = true;
+    },
+    releaseOwnerLock() {
+      owned = false;
+    },
+  };
+}
+
+// ---- Cloudflare Durable Object SQLite ----
+//
+// Adapter for ctx.storage.sql (+ transactionSync). PRAGMAs are not supported
+// by DO SQLite and are no-ops here; a DO is single-threaded and owns its
+// storage exclusively, so the owner lock is the in-process guard only.
+
+export interface DurableObjectSqlLike {
+  exec(query: string, ...bindings: unknown[]): { toArray(): Record<string, unknown>[] };
+}
+
+export function durableObjectSqlHandle(
+  sql: DurableObjectSqlLike,
+  transactionSync?: <T>(fn: () => T) => T,
+): SqliteHandle {
+  let owned = false;
+  let depth = 0;
+  return {
+    run(query, params = []) {
+      if (/^\s*pragma\b/i.test(query)) return { changes: 0, lastInsertRowid: 0 };
+      if (READER_RE.test(query)) {
+        sql.exec(query, ...params).toArray();
+        return { changes: 0, lastInsertRowid: 0 };
+      }
+      sql.exec(query, ...params).toArray();
+      const row = sql.exec("SELECT last_insert_rowid() AS id").toArray()[0];
+      return { changes: 0, lastInsertRowid: Number(row?.id ?? 0) };
+    },
+    get<T>(query: string, params: unknown[] = []) {
+      return sql.exec(query, ...params).toArray()[0] as T | undefined;
+    },
+    all<T>(query: string, params: unknown[] = []) {
+      return sql.exec(query, ...params).toArray() as T[];
+    },
+    transaction<T>(fn: () => T): T {
+      if (!transactionSync || depth > 0) {
+        // nested (or no txn API): fold into the outer scope — DO storage is
+        // single-threaded synchronous, so atomicity holds at the outer boundary
+        depth++;
+        try {
+          return fn();
+        } finally {
+          depth--;
+        }
+      }
+      depth++;
+      try {
+        return transactionSync(fn);
+      } finally {
+        depth--;
+      }
+    },
+    acquireOwnerLock() {
+      if (owned) throw new Error("DB already owned");
       owned = true;
     },
     releaseOwnerLock() {

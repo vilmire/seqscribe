@@ -2,6 +2,21 @@
 
 > Status: **non-normative companion to SPEC v3.2** (2026-08-26). The SPEC deliberately pushes identity, trust, signing, and adjudication to the host; those obligations are stated where each mechanism is defined and are therefore scattered. This document collects them into one place, per host role, with runbooks for the situations where the host is the only actor that can act. Where this guide and the SPEC disagree, the SPEC wins. This is the *generic* host contract — ADHDev-specific integration lives in the ADHDev repo (DESIGN §9.5).
 
+## 0. Helpers that implement this guide (src/host.ts)
+
+Every obligation below remains yours, but the common shapes ship as helpers — a shared-secret fleet wires up in a few lines:
+
+| Helper | Implements |
+|---|---|
+| `hmacAuthority({authorityId, secret, governs?})` | the full `AuthorityHooks` set (sign/verify finality, directives incl. §14 role binding via `governs`, takeover) with HMAC-SHA256 over JCS bytes |
+| `startFinalityLoop(node, {topics, authority, intervalMs})` | the §7.4 propose→sign→ingest cadence (authority host only) |
+| `manageReconnect(node, {dial, peerId, peerClass, grants})` | §5.2's "host reconnects": jittered exponential backoff, reset on healthy sessions |
+| `loadOrCreateWriterId(storage, {prefix})` | stable per-machine id persisted in sq_meta (clone/restore procedures must delete the row — see §7) |
+| `migrateLegacyJsonl(node, topic, lines, {kind})` | genesis migration of pre-seqscribe JSONL logs as fresh appends |
+| `webSocketChannel(ws)` / `betterSqlite3Handle(db, lockDb?)` / `sqliteWasmHandle(db)` / `durableObjectSqlHandle(sql, txn)` | transport + storage adapters (Node, browser wasm, Durable Objects); `lockDb` enables the crash-safe cross-process owner lock |
+| `httpBeaconTransport(base, account, token?)` / `beaconFetchHandler({token})` | the §14 beacon wire, client and Workers/DO-deployable server |
+| `node.stats()` | the §8 monitoring baseline below, one call |
+
 ## 1. What the host must bring (before the first byte syncs)
 
 | Obligation | Contract point | Notes |

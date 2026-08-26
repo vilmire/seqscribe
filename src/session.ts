@@ -76,12 +76,16 @@ export class Session {
     this.peerClass = opts.peerClass;
     this.grants = opts.grants;
 
-    // §14 attach ACL guard: metadata peers can never be granted content topics
+    // §14 attach ACL guard: metadata peers can never be granted content topics;
+    // a "full" grant on a subscribe-only topic would negotiate mutual full-sync
+    // against a topic that has no durable log to sync (proposals-v3.5)
     for (const [topic, mode] of Object.entries(opts.grants)) {
       if (mode === "none") continue;
       const policy = opts.topics.get(topic).policy;
       if (opts.peerClass === "metadata" && policy.access === "content")
         throw misuse(`metadata-class peer granted content topic ${topic}`);
+      if (mode === "full" && policy.replication === "subscribe-only")
+        throw misuse(`"full" grant on subscribe-only topic ${topic} — grant "serve" instead`);
     }
 
     opts.channel.onMessage((raw) => this.onRaw(raw));
@@ -170,6 +174,10 @@ export class Session {
 
   hasSendCapacity(): boolean {
     return this.stateNow === "ready" && this.outQueue.length < this.c.SEND_QUEUE_CAP;
+  }
+
+  queuedData(): number {
+    return this.outQueue.length + this.unacked.length;
   }
 
   private pumpData(): void {

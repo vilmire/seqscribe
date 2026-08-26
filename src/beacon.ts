@@ -137,3 +137,48 @@ export function httpBeaconTransport(
     },
   };
 }
+
+// Reference beacon as a fetch handler (§14 wire) — deployable on Cloudflare
+// Workers/Durable Objects or any fetch-shaped runtime. State lives in the
+// closure: run it inside a Durable Object (or a single instance) so the board
+// is actually shared; a stateless multi-isolate Worker would shard it.
+export interface FetchRequestLike {
+  method: string;
+  url: string;
+  headers: { get(name: string): string | null };
+  json(): Promise<unknown>;
+}
+
+export function beaconFetchHandler(o?: {
+  token?: string;
+}): (req: FetchRequestLike) => Promise<{ status: number; body: string }> {
+  const board = new Map<string, Map<string, BeaconReport>>(); // account → node → report
+  return async (req) => {
+    if (o?.token !== undefined && req.headers.get("authorization") !== `Bearer ${o.token}`)
+      return { status: 401, body: "" };
+    const URLCtor = (globalThis as unknown as {
+      URL: new (u: string, base?: string) => { pathname: string };
+    }).URL;
+    const path = new URLCtor(req.url, "http://x").pathname;
+    const m = /^\/v1\/a\/([^/]+)\/vectors$/.exec(path);
+    if (!m) return { status: 404, body: "" };
+    const account = decodeURIComponent(m[1]!);
+    if (req.method === "GET") {
+      const reports = [...(board.get(account)?.values() ?? [])];
+      return { status: 200, body: JSON.stringify(reports) };
+    }
+    if (req.method === "POST") {
+      try {
+        const report = (await req.json()) as BeaconReport;
+        if (typeof report.node !== "string") throw new Error("bad report");
+        const acct = board.get(account) ?? new Map<string, BeaconReport>();
+        acct.set(report.node, report); // one report per node, overwrite (§14)
+        board.set(account, acct);
+        return { status: 204, body: "" };
+      } catch {
+        return { status: 400, body: "" };
+      }
+    }
+    return { status: 405, body: "" };
+  };
+}

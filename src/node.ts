@@ -32,6 +32,29 @@ import type {
   Unsub,
 } from "./types.js";
 
+// Observability surface (extension beyond SPEC §14 — proposals-v3.5). The
+// host-guide's baseline metrics, one call away.
+export interface NodeStats {
+  topics: Record<
+    Topic,
+    {
+      writers: number;
+      logRows: number;
+      pending: number;
+      quarantined: number;
+      archived: number;
+      finalityGeneration: number | null;
+      certOrderAgeMs: number | null;
+      consumers: Record<string, { lastRowid: number; lagRows: number }>;
+    }
+  >;
+  peers: { peerId: string; state: string; dirtyStreams: number; queuedData: number }[];
+}
+
+export interface SeqscribeNodeExt extends SeqscribeNode {
+  stats(): NodeStats;
+}
+
 // Host globals via globalThis — the core compiles without platform lib types.
 const g = globalThis as unknown as {
   setTimeout(cb: () => void, ms: number): unknown;
@@ -55,7 +78,7 @@ function defaultRng(): () => number {
   return Math.random;
 }
 
-export function createSeqscribe(opts: CreateOpts): SeqscribeNode {
+export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
   assertWriter(opts.writerId);
   const constants = resolveConstants(opts.constants);
   const clock = opts.clock ?? (() => Date.now());
@@ -234,13 +257,41 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNode {
     },
   };
 
+  const stats = (): NodeStats => {
+    const out: NodeStats = { topics: {}, peers: sync.peerStats() };
+    const now = clock();
+    for (const topic of topics.list()) {
+      const cert = core.getCert(topic);
+      const maxRowid = store.maxRowid(topic);
+      const consumers: NodeStats["topics"][string]["consumers"] = {};
+      for (const c of store.cursorsForTopic(topic)) {
+        consumers[c.consumer] = {
+          lastRowid: c.lastRowid,
+          lagRows: Math.max(0, maxRowid - c.lastRowid),
+        };
+      }
+      out.topics[topic] = {
+        writers: store.listWriters(topic).length,
+        logRows: store.logCount(topic),
+        pending: store.pendingCountForTopic(topic),
+        quarantined: store.quarantineCount(topic),
+        archived: store.archivedCount(topic),
+        finalityGeneration: cert?.generation ?? null,
+        certOrderAgeMs: cert ? Math.max(0, now - cert.order.l) : null,
+        consumers,
+      };
+    }
+    return out;
+  };
+
   return Object.assign(node, {
+    stats,
     _core: core,
     _views: views,
     _registers: registers,
     _directives: directives,
     _sync: sync,
-  }) as SeqscribeNode;
+  }) as SeqscribeNodeExt;
 }
 
 // Internal escape hatch for the harness and tests (not part of the public API).

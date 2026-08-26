@@ -216,6 +216,15 @@ export class SyncEngine {
     for (const s of [...this.peers.keys()]) s.close();
   }
 
+  peerStats(): { peerId: string; state: string; dirtyStreams: number; queuedData: number }[] {
+    return [...this.peers.values()].map((ps) => ({
+      peerId: ps.session.peerId,
+      state: ps.session.state(),
+      dirtyStreams: ps.dirty.size,
+      queuedData: ps.session.queuedData(),
+    }));
+  }
+
   // ---- lifecycle ----
 
   private onReady(s: Session): void {

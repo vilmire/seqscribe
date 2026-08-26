@@ -45,6 +45,7 @@
     "canonicalize": "^2.0.0"
   },
   "devDependencies": {
+    "@sqlite.org/sqlite-wasm": "^3.53.0-build1",
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.18.1",

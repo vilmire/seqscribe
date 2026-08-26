@@ -15,5 +15,5 @@ export function memoryHandle(): SqliteHandle {
 }
 
 export function fileHandle(path: string): SqliteHandle {
-  return betterSqlite3Handle(new Database(path));
+  return betterSqlite3Handle(new Database(path), new Database(`${path}.lock`));
 }

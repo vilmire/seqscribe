@@ -69,6 +69,10 @@ export class VirtualLink {
       close: () => {
         if (sides[me].closed) return;
         sides[me].closed = true;
+        // the local endpoint always observes its own transport dying (a real
+        // socket fires 'close' on both ends); Session's re-entry guard makes
+        // the synchronous callback safe
+        sides[me].onClose?.();
         const peer = sides[other];
         if (!this.cutNow) {
           // close propagates unless the link is cut (a cut partition is silent)

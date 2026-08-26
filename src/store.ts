@@ -506,6 +506,28 @@ export class Store {
     return { ord: { l: r.ord_l, c: r.ord_c, writer: r.ord_w, seq: r.ord_s }, state: r.state };
   }
 
+  logCount(topic: Topic): number {
+    return (
+      this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM sq_log WHERE topic = ?", [topic])?.n ??
+      0
+    );
+  }
+
+  pendingCountForTopic(topic: Topic): number {
+    return (
+      this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM sq_pending WHERE topic = ?", [topic])
+        ?.n ?? 0
+    );
+  }
+
+  quarantineCount(topic: Topic): number {
+    return (
+      this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM sq_quarantine WHERE topic = ?", [
+        topic,
+      ])?.n ?? 0
+    );
+  }
+
   minRowidForTopic(topic: Topic): number | null {
     return (
       this.db.get<{ m: number | null }>("SELECT MIN(rowid) AS m FROM sq_log WHERE topic = ?", [
