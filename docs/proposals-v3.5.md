@@ -53,3 +53,23 @@ Proposed, in decreasing order of preference:
 3. **Distinguish the messages** — `ERR_DB_OWNED` for a real cross-process conflict, a distinct `ERR_MISUSE` for a double acquire from one handle, so the error text stops pointing at the wrong cause.
 
 **Status: implemented 2026-08-26** — (1) applied to all three adapters (better-sqlite3, sqlite-wasm, Durable Object); (2) host-guide §1 rewritten (library-managed, host calls are needless no-ops, `ERR_DB_OWNED` = real conflict only); (3) subsumed by (1) — the only remaining throw is the genuine cross-process case ("lock file held"). Regression: `test/channel-adapter.test.ts` P5 block, including host-acquires-first and second-process-refused.
+
+---
+
+> The four below were surfaced 2026-08-26 by the wire-boundary hardening pass (structural validation extended to all 19 message types — `src/messages.ts`, regression in `test/wire-hardening.test.ts`). Each is a place where the SPEC states the sender's obligation but not the receiver's remedy, or leaves a bound unstated that a hostile peer can exploit.
+
+## P6 — §5.2 names the credit obligation but no receiver remedy, and no flow-control ErrCode exists (§5.2, §16 error codes)
+
+A conforming sender keeps unACKed data frames ≤ INFLIGHT_CREDITS and ACK advances only to contiguous, so any legitimate frame satisfies `mid ≤ recvContigMid + INFLIGHT_CREDITS`. A frame beyond that window is not congestion — it is a protocol violation — yet §5.2 specifies nothing for the receiver, and unbounded tolerance means unbounded `recvBuffer` growth. Implemented: over-credit frame → ERR + session close (mids and credits reset on redial, so a buggy-but-honest peer recovers). The ERR rides `ERR_ENTRY_ENCODING` because no flow-control/protocol-violation code exists. Amendment: state the remedy in §5.2 and add a distinct code (e.g. `ERR_PROTOCOL`) to the error table.
+
+## P7 — chunked reassembly has no total bound: `of` is unbounded (§5.4 SNAP/SNAPSHOT/HAVE, §16)
+
+Every frame is individually capped by MAX_FRAME_BYTES, but SNAP/SNAPSHOT `of` and HAVE `of` (pagination) are unbounded, so a hostile peer can stream arbitrarily many distinct in-range chunks into one reassembly map — memory bounded only by the peer's patience. PROBE `seqs` length is likewise frame-capped only (our emitter stops at 32). Implemented: chunk indices are validated into [1, of], but `of` itself is taken on faith. Amendment: a §16 constant (e.g. `MAX_REASSEMBLY_BYTES`, with reassembly abandoned + ERR beyond it) and an explicit PROBE seqs cap.
+
+## P8 — the §1 charters admit `__proto__` (§1, §5.4)
+
+`TOPIC_RE` and `WRITER_RE` both match `__proto__`, and wire record maps keyed by charter names (grants, HAVE vectors, cut maps) are plain objects at most merge sites — an own `__proto__` key arriving from JSON.parse becomes a prototype *set* under index-assignment or `Object.assign`. Implemented: wire-level rejection of an own `__proto__` key in every record map. Amendment: exclude `__proto__` in the §1 charters themselves so the name is invalid at every layer (author append and import included), not just on the wire.
+
+## P9 — `SUB.params` is typed required but the wire form is optional (§5.4)
+
+`MsgSub.params: JsonValue` is required in the §5.4 table, but the emitter passes `undefined` through `JSON.stringify`, which drops the property — so the on-wire reality is optional and a strict second implementation would reject frames ours emits. Implemented: the validator accepts an absent `params`. Amendment: mark it optional in the §5.4 table (absent ≡ no params).
