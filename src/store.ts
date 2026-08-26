@@ -436,27 +436,31 @@ export class Store {
 
   // §7.6 cold archiving: move canonical covered rows out of the hot log.
   // Bounded by maxRowid so rows a live consumer hasn't passed stay put.
+  // Batched — a production FINALITY_WINDOW covers millions of rows (§20.8),
+  // and the first archive pass must not materialize them all at once.
   archiveCovered(topic: Topic, writer: WriterId, maxSeq: Seq, maxRowid: number, at: string): number {
-    return this.db.transaction(() => {
-      const rows = this.db.all<RawLogRow>(
-        `SELECT rowid, * FROM sq_log WHERE topic = ? AND writer = ? AND seq <= ? AND rowid <= ?`,
-        [topic, writer, maxSeq, maxRowid],
-      );
-      for (const r of rows) {
-        const { entry } = rowToEntry(r);
-        this.db.run(
-          "INSERT OR IGNORE INTO sq_archive (topic, writer, seq, entry, archived_at) VALUES (?, ?, ?, ?, ?)",
-          [topic, writer, r.seq, JSON.stringify(entry), at],
+    const BATCH = 2_000;
+    let total = 0;
+    for (;;) {
+      const moved = this.db.transaction(() => {
+        const rows = this.db.all<RawLogRow>(
+          `SELECT rowid, * FROM sq_log WHERE topic = ? AND writer = ? AND seq <= ? AND rowid <= ?
+           ORDER BY seq LIMIT ?`,
+          [topic, writer, maxSeq, maxRowid, BATCH],
         );
-      }
-      this.db.run("DELETE FROM sq_log WHERE topic = ? AND writer = ? AND seq <= ? AND rowid <= ?", [
-        topic,
-        writer,
-        maxSeq,
-        maxRowid,
-      ]);
-      return rows.length;
-    });
+        for (const r of rows) {
+          const { entry } = rowToEntry(r);
+          this.db.run(
+            "INSERT OR IGNORE INTO sq_archive (topic, writer, seq, entry, archived_at) VALUES (?, ?, ?, ?, ?)",
+            [topic, writer, r.seq, JSON.stringify(entry), at],
+          );
+          this.db.run("DELETE FROM sq_log WHERE rowid = ?", [r.rowid]);
+        }
+        return rows.length;
+      });
+      total += moved;
+      if (moved < BATCH) return total;
+    }
   }
 
   archivedCount(topic: Topic): number {

@@ -35,6 +35,7 @@ export interface P7Params {
   lossP: number;
   seed: number;
   constants: Partial<Constants>;
+  sampleFromMs?: number; // convergence sampling start (default: partitionEndMs)
 }
 
 interface P7Result {
@@ -155,11 +156,12 @@ export async function runP7(p: P7Params): Promise<P7Result> {
     return first !== "{}";
   };
 
-  // sample convergence every 5 s virtual after heal
-  const heal = p.partitionEndMs;
+  // sample convergence every 5 s virtual after heal (or an explicit start —
+  // a no-partition soak must sample only after the workload ends)
+  const heal = p.sampleFromMs ?? p.partitionEndMs;
   let convergedAtMs: number | null = null;
   for (let t = heal; t <= heal + p.gateMs; t += 5_000) {
-    await sched.run({ untilMs: t });
+    await sched.run({ untilMs: t, maxEvents: 50_000_000 });
     if (converged()) {
       convergedAtMs = t - heal;
       break;
@@ -195,9 +197,10 @@ describe.skipIf(!env?.SOAK)("soak profile (§19, non-gating)", () => {
       const r = await runP7({
         ...SPEC_PROFILE,
         partitionStartMs: 0,
-        partitionEndMs: 0, // no partition; "heal" at t=0 makes the sampler run from the start
+        partitionEndMs: 0, // no partition
         writesEndMs: 600_000,
-        gateMs: 660_000,
+        sampleFromMs: 600_000, // quiescence is measured after the workload ends
+        gateMs: 120_000,
         seed: 777,
       });
       // eslint-disable-next-line no-console
