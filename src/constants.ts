@@ -34,6 +34,13 @@ export const DEFAULT_CONSTANTS: Constants = {
   RETIRE_GRACE_MS: 2_592_000_000, // 30 d
   REQUEST_TTL_MS: 2_592_000_000, // 30 d
   TOMBSTONE_RETAIN_MS: 34_560_000_000, // 400 d
+  // sync_hot rate window (extension per proposals-v3.5 P24): served+applied
+  // sync bytes reaching SYNC_HOT_BYTES within one SYNC_HOT_WINDOW_MS window
+  // emits one informational sync_hot anomaly (at most one per window).
+  // Observation only — never a throttle: the traffic it flags is normal bulk
+  // catch-up, and suppressing it would only slow legitimate recovery.
+  SYNC_HOT_WINDOW_MS: 60_000,
+  SYNC_HOT_BYTES: 33_554_432, // 32 MiB per window ≈ 0.5 MiB/s sustained
   durability: "normal",
 };
 

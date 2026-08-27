@@ -4,7 +4,10 @@
 // branch now has the recovery branch's absorbing-state discipline, rejects
 // are counted into stats(), and the stall surfaces as a sync_stalled anomaly.
 // P23 (adapter statement cache) gets a direct prepare-count unit test; every
-// other suite exercises it implicitly through memoryHandle.
+// other suite exercises it implicitly through memoryHandle. P24 (interval
+// sync throughput) pins the complementary "hot and busy" observability:
+// served/applied interval counters, stats()-read reset, and the sync_hot
+// informational anomaly.
 
 import { describe, expect, it } from "vitest";
 import { VirtualLink } from "../harness/bus.js";
@@ -42,6 +45,7 @@ function makeNode(
   sched: Scheduler,
   writerId: string,
   verify: (c: FinalityCert) => boolean,
+  constants?: Partial<Constants>,
 ): { node: SeqscribeNodeExt; anomalies: Anomaly[] } {
   const anomalies: Anomaly[] = [];
   const node = createSeqscribe({
@@ -50,7 +54,7 @@ function makeNode(
     clock: sched.clock(),
     timers: sched.timers(),
     rng: () => 0.5,
-    constants: TEST_CONSTANTS,
+    constants: { ...TEST_CONSTANTS, ...constants },
     authority: { verifyFinality: verify },
   });
   node.onAnomaly((a) => anomalies.push(a));
@@ -144,6 +148,86 @@ describe("P22 — finality-branch WANT non-progress detection (incident regressi
     expect(coreOf(a.node).getStream(T, "wB").contigSeq).toBe(250);
     expect(a.anomalies.filter((x) => x.kind === "sync_stalled")).toEqual([]);
     expect(a.node.stats().peers[0]!.stalledStreams).toBe(0);
+    await Promise.all([a.node.close(), b.node.close()]);
+  });
+});
+
+describe("P24 — interval sync throughput in stats()", () => {
+  it("a served backlog shows up in interval counters on both ends, and reading stats() resets them", async () => {
+    const sched = new Scheduler(1_000_000);
+    const rng = new SeededRng(99);
+    const a = makeNode(sched, "wA", (c) => c.sig === "valid-sig");
+    const b = makeNode(sched, "wB", (c) => c.sig === "valid-sig");
+    for (let i = 0; i < 250; i++) void b.node.log(T).append("e", { i });
+    await sched.run({ untilMs: sched.now() + 1_000 });
+
+    const link = new VirtualLink(sched, rng);
+    a.node.attach(link.a, { peerId: "wB", peerClass: "content", grants: { [T]: "full" } });
+    b.node.attach(link.b, { peerId: "wA", peerClass: "content", grants: { [T]: "full" } });
+    await sched.run({ untilMs: sched.now() + 5_000 });
+    expect(coreOf(a.node).getStream(T, "wB").contigSeq).toBe(250);
+
+    // responder side: WANT service (+ knowledge push) counted as served
+    const sb = b.node.stats();
+    expect(sb.topics[T]!.sync.servedEntries).toBeGreaterThanOrEqual(250);
+    expect(sb.topics[T]!.sync.servedBytes).toBeGreaterThan(0);
+    expect(sb.topics[T]!.sync.wantRoundsServed).toBeGreaterThanOrEqual(1);
+    expect(sb.syncHotspots[0]).toMatchObject({ topic: T, peerId: "wA" });
+    expect(sb.syncHotspots[0]!.bytes).toBeGreaterThan(0);
+
+    // requester side: landed applies counted, WANT rounds issued
+    const sa = a.node.stats();
+    expect(sa.topics[T]!.sync.appliedEntries).toBeGreaterThanOrEqual(250);
+    expect(sa.topics[T]!.sync.appliedBytes).toBeGreaterThan(0);
+    expect(sa.topics[T]!.sync.wantRoundsRequested).toBeGreaterThanOrEqual(1);
+    expect(sa.syncHotspots[0]).toMatchObject({ topic: T, peerId: "wB" });
+
+    // default SYNC_HOT_BYTES (32 MiB) is far above this traffic — no anomaly
+    expect(a.anomalies.filter((x) => x.kind === "sync_hot")).toEqual([]);
+    expect(b.anomalies.filter((x) => x.kind === "sync_hot")).toEqual([]);
+
+    // interval semantics: the read above consumed the interval — a second
+    // read with no traffic in between is all zeros and hotspot-free
+    const sa2 = a.node.stats();
+    expect(sa2.topics[T]!.sync).toEqual({
+      servedEntries: 0,
+      servedBytes: 0,
+      appliedEntries: 0,
+      appliedBytes: 0,
+      wantRoundsRequested: 0,
+      wantRoundsServed: 0,
+    });
+    expect(sa2.syncHotspots).toEqual([]);
+
+    // and a fresh interval accumulates again
+    for (let i = 0; i < 5; i++) void b.node.log(T).append("more", { i });
+    await sched.run({ untilMs: sched.now() + 3_000 });
+    const sa3 = a.node.stats();
+    expect(sa3.topics[T]!.sync.appliedEntries).toBeGreaterThanOrEqual(5);
+
+    await Promise.all([a.node.close(), b.node.close()]);
+  });
+
+  it("crossing SYNC_HOT_BYTES within one window emits sync_hot once (informational, no throttle)", async () => {
+    const sched = new Scheduler(1_000_000);
+    const rng = new SeededRng(100);
+    // window longer than the whole test ⇒ at most one emission per node
+    const HOT: Partial<Constants> = { SYNC_HOT_BYTES: 1_000, SYNC_HOT_WINDOW_MS: 600_000 };
+    const a = makeNode(sched, "wA", (c) => c.sig === "valid-sig", HOT);
+    const b = makeNode(sched, "wB", (c) => c.sig === "valid-sig", HOT);
+    for (let i = 0; i < 250; i++) void b.node.log(T).append("e", { i });
+    await sched.run({ untilMs: sched.now() + 1_000 });
+
+    const link = new VirtualLink(sched, rng);
+    a.node.attach(link.a, { peerId: "wB", peerClass: "content", grants: { [T]: "full" } });
+    b.node.attach(link.b, { peerId: "wA", peerClass: "content", grants: { [T]: "full" } });
+    await sched.run({ untilMs: sched.now() + 5_000 });
+
+    // sync completed — the anomaly observed, never throttled
+    expect(coreOf(a.node).getStream(T, "wB").contigSeq).toBe(250);
+    expect(a.anomalies.filter((x) => x.kind === "sync_hot").length).toBe(1);
+    expect(b.anomalies.filter((x) => x.kind === "sync_hot").length).toBe(1);
+
     await Promise.all([a.node.close(), b.node.close()]);
   });
 });

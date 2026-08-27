@@ -17,7 +17,7 @@ import { RegisterHub } from "./register.js";
 import { SnapshotHub } from "./snapshot.js";
 import { Store } from "./store.js";
 import { SubHub } from "./subs.js";
-import { SyncEngine } from "./sync.js";
+import { SyncEngine, type TopicSyncCounters } from "./sync.js";
 import { TopicRegistry } from "./topics.js";
 import { ViewHub } from "./views.js";
 import type { PeerHandleExt } from "./session.js";
@@ -80,6 +80,11 @@ export interface NodeStats {
       // cumulative non-applied wire-apply outcomes (proposals-v3.5 P22) —
       // rejected_finality / sealed / forked / dropped_overflow / error
       applyRejects: Record<string, number>;
+      // interval sync throughput (proposals-v3.5 P24): counts accumulated
+      // since the PREVIOUS stats() call — every stats() read resets them
+      // (interval, not cumulative; applyRejects above stays cumulative).
+      // "hot and busy" is now distinguishable from P22's "hot and stuck".
+      sync: TopicSyncCounters;
     }
   >;
   peers: {
@@ -89,6 +94,9 @@ export interface NodeStats {
     queuedData: number;
     stalledStreams: number; // P22 — streams suspended for non-progress
   }[];
+  // P24 — top-5 (topic, peer) pairs by served+applied bytes this interval;
+  // bounded, and both identifiers are already public elsewhere in stats()
+  syncHotspots: { topic: Topic; peerId: string; bytes: number }[];
 }
 
 export interface SeqscribeNodeExt extends SeqscribeNode {
@@ -384,7 +392,10 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
   };
 
   const stats = (): NodeStats => {
-    const out: NodeStats = { topics: {}, peers: sync.peerStats() };
+    // P24 — one drain per stats() call: the interval counters cover
+    // [previous stats() read, this one] and reset atomically here
+    const interval = sync.drainIntervalStats();
+    const out: NodeStats = { topics: {}, peers: sync.peerStats(), syncHotspots: interval.hotspots };
     const now = clock();
     for (const topic of topics.list()) {
       const cert = core.getCert(topic);
@@ -406,6 +417,14 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
         certOrderAgeMs: cert ? Math.max(0, now - cert.order.l) : null,
         consumers,
         applyRejects: sync.rejectStats(topic),
+        sync: interval.topics.get(topic) ?? {
+          servedEntries: 0,
+          servedBytes: 0,
+          appliedEntries: 0,
+          appliedBytes: 0,
+          wantRoundsRequested: 0,
+          wantRoundsServed: 0,
+        },
       };
     }
     return out;

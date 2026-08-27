@@ -45,6 +45,21 @@ import type {
 // module constant rather than a §16 tunable (hosts may not vary it).
 const MAX_WANT_CONCURRENT = 4;
 const ENTRIES_BATCH_MAX = 100;
+// P24: hotspot list bound — the (topic, peer) byte leaderboard in stats() is
+// truncated to this many rows so it cannot grow with the peer census
+const SYNC_HOTSPOT_TOP_N = 5;
+
+// P24 interval sync-throughput counters, per topic. Drained (returned and
+// reset) by every stats() read — the interval is [previous stats() call, this
+// one]. Fixed scalar keys only.
+export interface TopicSyncCounters {
+  servedEntries: number; // entries sent in ENTRIES frames (WANT service + knowledge-based push)
+  servedBytes: number;
+  appliedEntries: number; // wire applies that landed: applied / duplicate / pending
+  appliedBytes: number;
+  wantRoundsRequested: number; // WANT requests issued (control-lane retries not re-counted)
+  wantRoundsServed: number; // WANT frames answered (a peer's retry re-serves, so it re-counts)
+}
 
 interface WantState {
   req: number;
@@ -100,6 +115,15 @@ export class SyncEngine {
   // (rejected_finality, sealed, forked, dropped_overflow, error) — the spin
   // was invisible precisely because rejects were silently discarded
   private readonly rejects = new Map<Topic, Record<string, number>>();
+  // P24 observability: interval throughput counters (drained by stats()) —
+  // the "hot and busy" complement to P22's "hot and stuck" stall signal
+  private readonly interval = new Map<Topic, TopicSyncCounters>();
+  private readonly intervalPairBytes = new Map<string, number>(); // `${topic}\u0000${peerId}` → served+applied bytes
+  // sync_hot rate window — informational only, never a throttle (§16
+  // SYNC_HOT_* constants; the traffic it flags is normal bulk catch-up)
+  private hotWindowStart = 0;
+  private hotWindowBytes = 0;
+  private hotEmitted = false;
   private finalityHub: FinalityHub | null = null;
   private subHub: SubHub | null = null;
   private directiveHub: DirectiveHub | null = null;
@@ -259,6 +283,72 @@ export class SyncEngine {
 
   rejectStats(topic: Topic): Record<string, number> {
     return { ...(this.rejects.get(topic) ?? {}) };
+  }
+
+  // P24 — drain-and-reset: each stats() read returns the counters accumulated
+  // since the previous read, plus the bounded (topic, peer) byte leaderboard.
+  drainIntervalStats(): {
+    topics: Map<Topic, TopicSyncCounters>;
+    hotspots: { topic: Topic; peerId: string; bytes: number }[];
+  } {
+    const topics = new Map(this.interval);
+    this.interval.clear();
+    const hotspots = [...this.intervalPairBytes]
+      .map(([k, bytes]) => {
+        const i = k.indexOf("\u0000");
+        return { topic: k.slice(0, i), peerId: k.slice(i + 1), bytes };
+      })
+      .sort((a, b) => b.bytes - a.bytes || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : a.peerId < b.peerId ? -1 : 1))
+      .slice(0, SYNC_HOTSPOT_TOP_N);
+    this.intervalPairBytes.clear();
+    return { topics, hotspots };
+  }
+
+  private counters(topic: Topic): TopicSyncCounters {
+    let c = this.interval.get(topic);
+    if (!c) {
+      c = {
+        servedEntries: 0,
+        servedBytes: 0,
+        appliedEntries: 0,
+        appliedBytes: 0,
+        wantRoundsRequested: 0,
+        wantRoundsServed: 0,
+      };
+      this.interval.set(topic, c);
+    }
+    return c;
+  }
+
+  private noteThroughput(
+    topic: Topic,
+    peerId: string,
+    entries: number,
+    bytes: number,
+    dir: "served" | "applied",
+  ): void {
+    const c = this.counters(topic);
+    if (dir === "served") {
+      c.servedEntries += entries;
+      c.servedBytes += bytes;
+    } else {
+      c.appliedEntries += entries;
+      c.appliedBytes += bytes;
+    }
+    const pk = `${topic}\u0000${peerId}`;
+    this.intervalPairBytes.set(pk, (this.intervalPairBytes.get(pk) ?? 0) + bytes);
+    // sync_hot: at most one anomaly per SYNC_HOT_WINDOW_MS window
+    const now = this.o.clock();
+    if (now - this.hotWindowStart >= this.o.constants.SYNC_HOT_WINDOW_MS) {
+      this.hotWindowStart = now;
+      this.hotWindowBytes = 0;
+      this.hotEmitted = false;
+    }
+    this.hotWindowBytes += bytes;
+    if (!this.hotEmitted && this.hotWindowBytes >= this.o.constants.SYNC_HOT_BYTES) {
+      this.hotEmitted = true;
+      this.o.emitAnomaly({ kind: "sync_hot" });
+    }
   }
 
   // ---- lifecycle ----
@@ -456,6 +546,7 @@ export class SyncEngine {
         done,
       }));
       if (!accepted) return; // queue full — keep dirty, resume on onCapacity
+      this.noteThroughput(d.topic, ps.session.peerId, batch.length, bytes, "served");
       ps.known.set(key, last.seq); // optimistic; the next HAVE round is authoritative
       if (done) ps.dirty.delete(key);
     }
@@ -503,6 +594,7 @@ export class SyncEngine {
         fromSeq: recovery ? recoveryFrom : head.contigSeq + 1,
       };
       ps.activeWants.set(req, want);
+      this.counters(want.topic).wantRoundsRequested += 1; // P24 round cadence
       ps.session.request(
         `WANT:${req}`,
         (): MsgWant => ({
@@ -631,6 +723,7 @@ export class SyncEngine {
       ps.session.sendControl({ t: "ERR", code: "ERR_ACL_DENIED", ref: m.topic });
       return;
     }
+    this.counters(m.topic).wantRoundsServed += 1; // P24 round cadence
     if (this.snapshotHub?.maybeOffer(ps.session, m.topic, m.writer, m.fromSeq)) {
       // the WANT itself completes empty — the snapshot path supplies the basis,
       // and the requester re-WANTs above the cut after adoption
@@ -698,6 +791,7 @@ export class SyncEngine {
         done,
       }));
       if (!accepted) return; // tail-dropped — the requester's WANT retry recovers
+      this.noteThroughput(m.topic, ps.session.peerId, batch.length, bytes, "served");
       from = last.seq + 1;
     }
   }
@@ -719,6 +813,7 @@ export class SyncEngine {
     const key = `${m.topic}\u0000${m.writer}`;
     if ((ps.known.get(key) ?? 0) < m.toSeq) ps.known.set(key, m.toSeq); // the sender holds ≥ toSeq
     const applies: Promise<ApplyResult | "error">[] = [];
+    const costs: number[] = []; // P24 — same measure as the serve side
     for (const raw of m.entries) {
       let entry: LogEntry;
       try {
@@ -729,6 +824,7 @@ export class SyncEngine {
         continue;
       }
       if (entry.topic !== m.topic || entry.writer !== m.writer) continue;
+      costs.push(utf8ByteLength(JSON.stringify(entry)));
       applies.push(
         this.o.core.applyExternal(entry, ps.session.peerId).catch(() => "error" as const),
       );
@@ -736,13 +832,24 @@ export class SyncEngine {
     void Promise.all(applies).then((results) => {
       // P22 point 2/4: apply outcomes are no longer discarded — non-applied
       // outcomes feed the per-topic reject counters stats() exposes, so an
-      // all-rejected round is visible instead of symptomless
-      for (const r of results) {
-        if (r === "applied" || r === "duplicate" || r === "pending") continue;
+      // all-rejected round is visible instead of symptomless. P24 counts the
+      // complementary landed outcomes (applied/duplicate/pending) as interval
+      // throughput — the "real, useful sync work" side of the same signal.
+      let appliedN = 0;
+      let appliedB = 0;
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i]!;
+        if (r === "applied" || r === "duplicate" || r === "pending") {
+          appliedN += 1;
+          appliedB += costs[i]!;
+          continue;
+        }
         const rec = this.rejects.get(m.topic) ?? {};
         rec[r] = (rec[r] ?? 0) + 1;
         this.rejects.set(m.topic, rec);
       }
+      if (appliedN > 0)
+        this.noteThroughput(m.topic, ps.session.peerId, appliedN, appliedB, "applied");
       if (m.req !== undefined && m.done) {
         const want = ps.activeWants.get(m.req);
         this.finishWant(ps, m.req);

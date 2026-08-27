@@ -119,6 +119,8 @@ export interface Constants {
   RETIRE_GRACE_MS: number;
   REQUEST_TTL_MS: number;
   TOMBSTONE_RETAIN_MS: number;
+  SYNC_HOT_WINDOW_MS: number;
+  SYNC_HOT_BYTES: number;
   durability: "normal" | "full";
 }
 
@@ -307,7 +309,8 @@ export interface Anomaly {
     | "view_faulted"
     | "consumer_abandoned"
     | "canonical_unavailable"
-    | "sync_stalled"; // extension (proposals-v3.5 P22): WANT rounds toward a peer stopped progressing
+    | "sync_stalled" // extension (proposals-v3.5 P22): WANT rounds toward a peer stopped progressing
+    | "sync_hot"; // extension (proposals-v3.5 P24): sync moved ≥ SYNC_HOT_BYTES within one SYNC_HOT_WINDOW_MS — informational, never a throttle
   entry?: LogEntry;
 }
 
