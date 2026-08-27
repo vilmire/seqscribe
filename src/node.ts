@@ -4,7 +4,8 @@
 
 import { BeaconHub } from "./beacon.js";
 import { assertWriter } from "./codec.js";
-import { ConsumerHub } from "./consume.js";
+import { ConsumerHub, type ConsumerInfo, type ConsumerResetResult } from "./consume.js";
+import { orderCompare, orderOf } from "./hlc.js";
 import { resolveConstants } from "./constants.js";
 import { DirectiveHub } from "./directives.js";
 import { misuse } from "./errors.js";
@@ -28,11 +29,39 @@ import type {
   EntryId,
   JsonValue,
   LogEntry,
+  Order,
+  Seq,
   SeqscribeNode,
   Timers,
   Topic,
   Unsub,
+  WriterId,
 } from "./types.js";
+
+// Bounded read-only inspection (proposals-v3.5 P21). Two mutually exclusive
+// forms: canonical total-order (`after`/`through` Orders — pin `through` via
+// headOrder() so both sides of a comparison share one closed interval) and
+// per-writer seq range (`writer` + fromSeq/toSeq — spans the cold archive).
+// Never creates a durable cursor, never gates archiving.
+export interface ScanOptions {
+  after?: Order; // canonical form: exclusive lower bound
+  through?: Order; // canonical form: inclusive upper bound (a pinned head)
+  writer?: WriterId; // writer form: selects the seq-range scan
+  fromSeq?: Seq; // writer form: inclusive, default 1
+  toSeq?: Seq; // writer form: inclusive, default the local contiguous head
+  limit?: number; // page bound — default 500, hard cap 10_000
+}
+
+export interface ScanResult {
+  entries: LogEntry[];
+  complete: boolean; // false = limit truncated the page; resume via nextAfter/nextFromSeq
+  // the requested lower bound predates locally available retention: canonical
+  // scans do not see cold-archived rows (§7.6), writer scans DO span the
+  // archive, so here it means rows below the first locally held seq
+  truncatedBelow: boolean;
+  nextAfter?: Order; // canonical form resume token
+  nextFromSeq?: Seq; // writer form resume token
+}
 
 // Observability surface (extension beyond SPEC §14 — proposals-v3.5). The
 // host-guide's baseline metrics, one call away.
@@ -55,6 +84,20 @@ export interface NodeStats {
 
 export interface SeqscribeNodeExt extends SeqscribeNode {
   stats(): NodeStats;
+  // Durable-consumer lifecycle (proposals-v3.5 P17–P19) — reset/delete/prune
+  // are inactive-consumer operations; caughtUp needs the consumer registered.
+  resetConsumer(
+    topic: Topic,
+    consumer: string,
+    o?: { from?: "earliest-retained" | "head" },
+  ): ConsumerResetResult;
+  deleteConsumer(topic: Topic, consumer: string): { existed: boolean };
+  listConsumers(topic: Topic): ConsumerInfo[];
+  pruneConsumers(topic: Topic, o?: { prefix?: string; inactiveBefore?: number }): string[];
+  consumerCaughtUp(topic: Topic, consumer: string): Promise<{ throughRowid: number }>;
+  // Bounded inspection (P21)
+  scanEntries(topic: Topic, o?: ScanOptions): ScanResult;
+  headOrder(topic: Topic): Order | null; // pin scan `through` / comparison heads
   // The handle attach really returns (proposals-v3.5 P15/P16): the SPEC §14
   // PeerHandle plus reasoned lifecycle and runtime grant re-advertisement.
   attach(
@@ -281,6 +324,56 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
     },
   };
 
+  // P21 — bounded read-only scans over what this node holds locally.
+  const SCAN_DEFAULT_LIMIT = 500;
+  const SCAN_MAX_LIMIT = 10_000;
+  const scanEntries = (topic: Topic, o: ScanOptions = {}): ScanResult => {
+    if (closed) throw misuse("node is closed");
+    topics.get(topic);
+    const limit = Math.min(Math.max(1, Math.floor(o.limit ?? SCAN_DEFAULT_LIMIT)), SCAN_MAX_LIMIT);
+    if (o.writer !== undefined) {
+      if (o.after !== undefined || o.through !== undefined)
+        throw misuse("scanEntries: writer form takes fromSeq/toSeq, not after/through");
+      const head = core.getStream(topic, o.writer);
+      const fromSeq = o.fromSeq ?? 1;
+      const toSeq = o.toSeq ?? head.contigSeq;
+      if (toSeq < fromSeq) return { entries: [], complete: true, truncatedBelow: false };
+      // a seq window of `limit` bounds the page regardless of gaps — an
+      // under-filled page just resumes at nextFromSeq
+      const windowEnd = Math.min(toSeq, fromSeq + limit - 1);
+      const bySeq = new Map<number, LogEntry>();
+      for (const e of store.archivedEntries(topic, o.writer, fromSeq, windowEnd)) bySeq.set(e.seq, e);
+      for (const { entry } of store.entriesRange(topic, o.writer, fromSeq, windowEnd))
+        bySeq.set(entry.seq, entry);
+      const entries = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+      const complete = windowEnd >= toSeq;
+      const firstAvail = entries[0]?.seq;
+      const truncatedBelow =
+        firstAvail !== undefined ? firstAvail > fromSeq : head.contigSeq >= fromSeq;
+      const r: ScanResult = { entries, complete, truncatedBelow };
+      if (!complete) r.nextFromSeq = windowEnd + 1;
+      return r;
+    }
+    if (o.fromSeq !== undefined || o.toSeq !== undefined)
+      throw misuse("scanEntries: fromSeq/toSeq require writer");
+    const fetched = store.entriesAfterOrder(topic, o.after ?? null, limit + 1);
+    // canonical order is the fetch order, so rows beyond `through` are a suffix
+    const within = o.through
+      ? fetched.filter((e) => orderCompare(orderOf(e), o.through!) <= 0)
+      : fetched;
+    const entries = within.slice(0, limit);
+    const complete = within.length <= limit && (within.length < fetched.length || fetched.length <= limit);
+    // canonical scans read the hot log only — cold-archived rows (§7.6) sit
+    // below the cut; a lower bound under the cut order is therefore incomplete
+    const cert = core.getCert(topic);
+    const truncatedBelow =
+      store.archivedCount(topic) > 0 &&
+      (o.after === undefined || (cert !== null && orderCompare(o.after, cert.order) < 0));
+    const r: ScanResult = { entries, complete, truncatedBelow };
+    if (!complete && entries.length > 0) r.nextAfter = orderOf(entries[entries.length - 1]!);
+    return r;
+  };
+
   const stats = (): NodeStats => {
     const out: NodeStats = { topics: {}, peers: sync.peerStats() };
     const now = clock();
@@ -313,6 +406,19 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
   // SPEC-shaped SeqscribeNode, whose attach names the base PeerHandle.
   return Object.assign(node, {
     stats,
+    resetConsumer: (topic: Topic, consumer: string, o?: { from?: "earliest-retained" | "head" }) =>
+      consumers.resetConsumer(topic, consumer, o),
+    deleteConsumer: (topic: Topic, consumer: string) => consumers.deleteConsumer(topic, consumer),
+    listConsumers: (topic: Topic) => consumers.listConsumers(topic),
+    pruneConsumers: (topic: Topic, o?: { prefix?: string; inactiveBefore?: number }) =>
+      consumers.pruneConsumers(topic, o),
+    consumerCaughtUp: (topic: Topic, consumer: string) => consumers.caughtUp(topic, consumer),
+    scanEntries,
+    headOrder: (topic: Topic): Order | null => {
+      if (closed) throw misuse("node is closed");
+      topics.get(topic);
+      return store.maxOrderUpTo(topic, Number.MAX_SAFE_INTEGER);
+    },
     _core: core,
     _views: views,
     _registers: registers,

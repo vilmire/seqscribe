@@ -77,4 +77,12 @@ export {
   type ReconnectHandle,
   type PeerUnresponsiveInfo,
 } from "./host.js";
-export { createSeqscribe, coreOf, type SeqscribeNodeExt, type NodeStats } from "./node.js";
+export {
+  createSeqscribe,
+  coreOf,
+  type SeqscribeNodeExt,
+  type NodeStats,
+  type ScanOptions,
+  type ScanResult,
+} from "./node.js";
+export type { ConsumerInfo, ConsumerResetResult } from "./consume.js";

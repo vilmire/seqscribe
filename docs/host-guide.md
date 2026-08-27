@@ -13,6 +13,9 @@ Every obligation below remains yours, but the common shapes ship as helpers — 
 | `manageReconnect(node, {dial, peerId, peerClass, grants, onPeerUnresponsive?, onEvent?})` | §5.2's "host reconnects": jittered exponential backoff, reset on healthy sessions; `onPeerUnresponsive` flags an endpoint that dials but never speaks seqscribe (v3.5-P10), `onEvent` forwards the reasoned lifecycle feed (v3.5-P16), `grants` accepts a thunk and the handle has `updateGrants` for runtime topics (v3.5-P15) |
 | `sanitizeJson(value)` | opt-in normalizer for loose payloads: drops undefined object properties, rejects undefined array elements; output passes `assertJsonValue`/JCS unchanged (v3.5-P12) |
 | `estimateEntryBytes(shape, ctx?)` | append-oriented size check BEFORE enqueue — exact with writer/seq/hlc context, conservative upper bound without; compare against `MAX_ENTRY_BYTES` (v3.5-P13) |
+| `node.resetConsumer` / `deleteConsumer` / `listConsumers` / `pruneConsumers` | durable-consumer lifecycle: same-name rebuild replay (with archived-coverage metadata), explicit cursor deletion + GC — all inactive-consumer operations (v3.5-P17/P18) |
+| `node.consumerCaughtUp(topic, consumer)` | deterministic readiness gate: resolves once every entry through the call-time head has completed its callback — replaces `lagRows === 0` polling (v3.5-P19) |
+| `node.scanEntries(topic, opts)` / `node.headOrder(topic)` | bounded read-only scans: canonical order with a pinned `through` interval, or per-writer seq ranges spanning the cold archive; never creates a cursor (v3.5-P21) |
 | `loadOrCreateWriterId(storage, {prefix})` | stable per-machine id persisted in sq_meta (clone/restore procedures must delete the row — see §7) |
 | `migrateLegacyJsonl(node, topic, lines, {kind})` | genesis migration of pre-seqscribe JSONL logs as fresh appends |
 | `webSocketChannel(ws)` (= `dataChannelChannel`) / `betterSqlite3Handle(db, lockDb?)` / `sqliteWasmHandle(db)` / `durableObjectSqlHandle(sql, txn)` | transport + storage adapters — the socket channel accepts WebSocket, RTCDataChannel, and `isOpen()` wrappers (v3.5-P4); `lockDb` enables the crash-safe cross-process owner lock |
@@ -41,6 +44,18 @@ Every obligation below remains yours, but the common shapes ship as helpers — 
 Ordering between the two sides is free: the topic becomes mutual when the second side's update lands, and the library immediately runs a HAVE round so existing backlogs converge without waiting for anti-entropy. The re-advertisement is retried until acknowledged, so frame loss cannot strand it. Mutating the grants object you passed to `attach` does nothing (the session copies it) — `updateGrants` is the only path. Both endpoints must run a v3.5-P15 build.
 
 **Session lifecycle & the unresponsive-peer signal (P10/P16).** `attach` returns a `PeerHandleExt`: `onLifecycle(cb)` replays history on subscribe (you always see `attached`) and every `closed` names its `SessionCloseReason` — wire this into your logging; it is the instrumentation ADHDev had to hand-roll. Triage: `hello_timeout` = the endpoint is reachable but not speaking seqscribe (misclassified URL, wrong port — check your peer classification, not the network); `transport` = the channel died (ordinary — reconnect handles it); `protocol` = the peer violated the wire contract (a bug or a hostile peer — worth a log line with the preceding ERR frame); `stall` = no ACK progress for CHANNEL_STALL_MS; `detach`/`node_closed` = you. Under `manageReconnect`, set `onPeerUnresponsive` (default threshold 3 consecutive HELLO timeouts) and alert from it — return `"stop"` to stop dialing a misclassified endpoint instead of flapping forever.
+
+## 1.6 Multi-process hosts — one owner, delegated writes (v3.5-P20)
+
+The ownership rule (§1, §8) is absolute: **exactly one process opens `seqscribe.db`**; two full nodes on one database is corruption, not degraded mode, and a second "read-only" SQLite open of the same file is equally unsupported (the owner's caches and WAL assumptions do not survive a second reader). When your application's legitimate writers live in several local processes, the supported shape is **delegation to the owner over IPC** — verified as the gap in ADHDev's daemon/mcp-server split, where a bypassed second-process write degraded into parity-driven repair work:
+
+- **Pick the owner.** One long-lived process (usually your daemon) calls `createSeqscribe` and holds the node. Every other process holds an IPC client, never the DB path.
+- **Append intents, not appends.** The client sends `{topic, kind, payload, idempotencyKey}` over any local IPC (unix socket, pipe, localhost HTTP). The owner appends and returns the `EntryId`. The **idempotency key is mandatory**: IPC is at-least-once under timeouts/retries, so the owner keeps a bounded `idempotencyKey → EntryId` map (a small table or LRU) and answers duplicates with the original id — that turns retried intents into exactly-once appends. Run intent payloads through `sanitizeJson` and `estimateEntryBytes` on the client so oversize/encoding failures are rejected before the hop.
+- **Backpressure.** The owner should bound its intent queue (`stats()` exposes pending/queue depths) and answer over-bound intents with a retryable rejection; clients treat any non-duplicate failure as retryable-with-backoff, never as "write directly".
+- **Owner unavailable.** Either fail fast to the caller or spool intents durably (append-only file) and drain on reconnect — the spool preserves the idempotency keys. **Never** fall back to opening the DB; `ERR_DB_OWNED` from such an attempt is the guard working, not a bug.
+- **Reads.** Delegate them the same way: the owner can serve `scanEntries` pages, subscription snapshots, or view queries over the IPC. This keeps the single-process invariant while giving auxiliary processes bounded, race-free reads (P21's pinned `through` works across the hop).
+
+A library-level auxiliary-writer client and a true read-only open are deliberately not shipped yet — the pattern above covers the known deployments, and their surface should be shaped by the first production consumer that outgrows it (proposals-v3.5 P20 status).
 
 ## 2. Authority operations (the heaviest role)
 
@@ -99,6 +114,8 @@ Every `onEntry` delivery is **provisional until covered by a certificate** (§7.
 | Irreversible **and** timely | provisional + **your own compensation** | `entry_quarantined` is best-effort hygiene, not a correctness channel (offline consumers miss it, §7.5); no spec mechanism removes this trade-off — budget for host-level compensation logic |
 
 Also: keep consumers draining. A consumer idle past FINALITY_WINDOW_MS is dropped (`consumer_abandoned`) and resumes with a cursor reset to post-cut — silently skipping the archived middle.
+
+Lifecycle (v3.5-P17–P19): rebuild a consumer's derived state by `unsubscribe → resetConsumer(topic, name) → onEntry(topic, name, …)` — the same stable name replays, and the result's `archivedRows` tells you when "start" is the archive floor rather than genesis (completeness below the cut is the snapshot's job, not replay's). Gate cutovers on `consumerCaughtUp(topic, name)` instead of polling `lagRows`; it resolves only after every entry through the call-time head has completed its callback. Retire versioned/renamed consumers with `deleteConsumer`/`pruneConsumers` — leftover cursors hold the archive floor until they age into `consumer_abandoned`.
 
 ## 5. owned keys, requests, takeover
 
