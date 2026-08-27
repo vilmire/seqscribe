@@ -29,6 +29,11 @@ export interface MsgHello {
   protoMax: number;
   node: WriterId;
   grants: Record<Topic, { mode: "full" | "serve" | "none"; schemaHash: string }>;
+  // P15 grant re-advertisement (extension; absent ≡ 0 / not-an-ack): grantsGen
+  // versions the sender's grant map; ackGen marks the frame as the answer to a
+  // post-ready re-advertisement carrying that gen. Pre-P15 peers ignore both.
+  grantsGen?: number;
+  ackGen?: number;
 }
 export interface MsgHaveGet {
   t: "HAVE_GET";
@@ -296,6 +301,8 @@ function validateShape(m: Rec): void {
       vNonNeg(t, m.protoMin, "protoMin");
       vNonNeg(t, m.protoMax, "protoMax");
       vWriter(t, m.node, "node");
+      if (m.grantsGen !== undefined) vNonNeg(t, m.grantsGen, "grantsGen");
+      if (m.ackGen !== undefined) vNonNeg(t, m.ackGen, "ackGen");
       for (const [topic, g] of vMap(t, m.grants, "grants")) {
         vTopic(t, topic, "grants key");
         if (typeof g !== "object" || g === null) bad(t, `grants[${topic}] must be an object`);

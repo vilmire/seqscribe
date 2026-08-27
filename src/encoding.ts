@@ -57,6 +57,48 @@ export function assertJsonValue(v: unknown, path = "$"): asserts v is JsonValue 
   throw new SeqscribeError("ERR_ENTRY_ENCODING", `unsupported type ${t} at ${path}`);
 }
 
+// Opt-in normalizer (proposals-v3.5 P12) for the routine JavaScript payload
+// shape { k: undefined }: returns a fresh tree with undefined object
+// properties DROPPED (what JSON.stringify would do), guaranteed to pass
+// assertJsonValue and JCS unchanged. Array positions are load-bearing (§4
+// canonical encoding), so an undefined ARRAY element throws instead of
+// shifting or silently becoming null. The strict default stands — append()
+// still rejects unsanitized input; call this first when payloads are loose.
+export function sanitizeJson(v: unknown, path = "$"): JsonValue {
+  if (v === null) return null;
+  const t = typeof v;
+  if (t === "string" || t === "boolean") return v as JsonValue;
+  if (t === "number") {
+    if (!Number.isFinite(v as number))
+      throw new SeqscribeError("ERR_ENTRY_ENCODING", `non-finite number at ${path}`);
+    return v as JsonValue;
+  }
+  if (Array.isArray(v)) {
+    return v.map((el, i) => {
+      if (el === undefined)
+        throw new SeqscribeError(
+          "ERR_ENTRY_ENCODING",
+          `undefined array element at ${path}[${i}] — removing it would shift positions`,
+        );
+      return sanitizeJson(el, `${path}[${i}]`);
+    });
+  }
+  if (t === "object") {
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null)
+      throw new SeqscribeError("ERR_ENTRY_ENCODING", `non-plain object at ${path}`);
+    const pairs: [string, JsonValue][] = [];
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      if (val === undefined) continue; // the point of this helper
+      pairs.push([k, sanitizeJson(val, `${path}.${k}`)]);
+    }
+    // fromEntries defines own data properties — an own "__proto__" key stays a
+    // key instead of becoming a prototype set under index-assignment
+    return Object.fromEntries(pairs);
+  }
+  throw new SeqscribeError("ERR_ENTRY_ENCODING", `unsupported type ${t} at ${path}`);
+}
+
 export function jcs(v: JsonValue): string {
   const s = canonicalizeLib(v);
   if (typeof s !== "string")

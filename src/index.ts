@@ -11,6 +11,7 @@ export { SeqscribeError } from "./errors.js";
 export { DEFAULT_CONSTANTS, resolveConstants } from "./constants.js";
 export {
   assertJsonValue,
+  sanitizeJson,
   jcs,
   frame,
   dec,
@@ -36,12 +37,21 @@ export {
 export {
   validateEntry,
   assertEntrySize,
+  estimateEntryBytes,
   assertTopic,
   assertWriter,
   assertKey,
   TOPIC_RE,
   WRITER_RE,
+  type AppendShape,
 } from "./codec.js";
+// Peer-session extension types (proposals-v3.5 P10/P15/P16) — the Session
+// class itself stays internal; only the handle/event shapes are public.
+export type {
+  SessionCloseReason,
+  PeerLifecycleEvent,
+  PeerHandleExt,
+} from "./session.js";
 export { validatePolicy, conflictPolicyFor } from "./topics.js";
 export { exportTopic, importTopic } from "./export.js";
 export { httpBeaconTransport, beaconFetchHandler, type FetchRequestLike } from "./beacon.js";
@@ -65,5 +75,6 @@ export {
   type HmacAuthorityOpts,
   type FinalityLoopHandle,
   type ReconnectHandle,
+  type PeerUnresponsiveInfo,
 } from "./host.js";
 export { createSeqscribe, coreOf, type SeqscribeNodeExt, type NodeStats } from "./node.js";

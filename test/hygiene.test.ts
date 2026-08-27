@@ -281,8 +281,9 @@ describe("close() quiesces (§14)", () => {
     expect(state.ops).toBe(opsAtClose);
     expect(attempts).toBe(attemptsAtClose);
 
-    // closed surface: appends refuse, second close is a no-op
-    expect(() => node.log(T).append("note", {})).toThrowError(SeqscribeError);
+    // closed surface: appends refuse (async — P11 one-failure-channel), second
+    // close is a no-op
+    await expect(node.log(T).append("note", {})).rejects.toThrowError(SeqscribeError);
     await node.close();
     expect(state.ops).toBe(opsAtClose);
   });

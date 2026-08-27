@@ -19,9 +19,11 @@ import { SubHub } from "./subs.js";
 import { SyncEngine } from "./sync.js";
 import { TopicRegistry } from "./topics.js";
 import { ViewHub } from "./views.js";
+import type { PeerHandleExt } from "./session.js";
 import type {
   Anomaly,
   BeaconReport,
+  Channel,
   CreateOpts,
   EntryId,
   JsonValue,
@@ -53,6 +55,16 @@ export interface NodeStats {
 
 export interface SeqscribeNodeExt extends SeqscribeNode {
   stats(): NodeStats;
+  // The handle attach really returns (proposals-v3.5 P15/P16): the SPEC §14
+  // PeerHandle plus reasoned lifecycle and runtime grant re-advertisement.
+  attach(
+    ch: Channel,
+    o: {
+      peerId: string;
+      peerClass: "content" | "metadata";
+      grants: Record<Topic, "full" | "serve" | "none">;
+    },
+  ): PeerHandleExt;
 }
 
 // Host globals via globalThis — the core compiles without platform lib types.
@@ -192,12 +204,15 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
     },
 
     log(topic: Topic) {
-      const policy = topics.get(topic).policy;
       return {
         append(kind: string, payload: JsonValue, o?: { ref?: EntryId }): Promise<EntryId> {
-          // §11.1: raw append on a register topic is a synchronous ERR_MISUSE —
-          // register writes go only through helpers so causal stamping stays sound.
-          if (policy.kind === "register")
+          // One asynchronous failure contract (proposals-v3.5 P11): every
+          // data-dependent preflight failure — closed node, unknown topic,
+          // encoding — rejects the returned Promise (SPEC §14 error carriage:
+          // "Promise-returning APIs reject"). The single surviving synchronous
+          // throw is §11.1's raw append on a register topic ("throws" is
+          // normative there): a static API-misuse, not a runtime condition.
+          if (topics.has(topic) && topics.get(topic).policy.kind === "register")
             throw misuse(`raw append on register topic ${topic} — use register(topic) helpers`);
           return core.append(topic, kind, payload, o?.ref ? { ref: o.ref } : undefined);
         },
@@ -293,6 +308,9 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
     return out;
   };
 
+  // The double cast is sound: node.attach delegates to sync.attach, which
+  // really returns PeerHandleExt — the literal is merely annotated with the
+  // SPEC-shaped SeqscribeNode, whose attach names the base PeerHandle.
   return Object.assign(node, {
     stats,
     _core: core,
@@ -300,7 +318,7 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
     _registers: registers,
     _directives: directives,
     _sync: sync,
-  }) as SeqscribeNodeExt;
+  }) as unknown as SeqscribeNodeExt;
 }
 
 // Internal escape hatch for the harness and tests (not part of the public API).

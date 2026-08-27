@@ -19,7 +19,7 @@ import type {
   MsgSnapshot,
   MsgWant,
 } from "./messages.js";
-import { Session } from "./session.js";
+import { Session, type PeerHandleExt } from "./session.js";
 import type { DirectiveHub } from "./directives.js";
 import type { FinalityHub } from "./finality.js";
 import type { SnapshotHub } from "./snapshot.js";
@@ -168,7 +168,7 @@ export class SyncEngine {
       peerClass: "content" | "metadata";
       grants: Record<Topic, "full" | "serve" | "none">;
     },
-  ): PeerHandle {
+  ): PeerHandleExt {
     const session = new Session({
       channel: ch,
       peerId: o.peerId,
@@ -186,6 +186,13 @@ export class SyncEngine {
       onCapacity: (s) => {
         const ps2 = this.peers.get(s);
         if (ps2) this.pumpDirty(ps2);
+      },
+      // P15: a grant update (local or the peer's) changes the mutual set —
+      // start a HAVE round immediately so newly mutual-full topics converge
+      // without waiting for the anti-entropy cadence
+      onGrantsUpdated: (s) => {
+        const ps2 = this.peers.get(s);
+        if (ps2 && s.state() === "ready") this.startHaveRound(ps2);
       },
     });
     const ps: PeerState = {
@@ -212,12 +219,15 @@ export class SyncEngine {
       peerId: o.peerId,
       state: () => session.state(),
       onStateChange: (cb): Unsub => session.onStateChange(cb),
-      detach: () => session.close(),
+      detach: () => session.close("detach"),
+      closeReason: () => session.closeReason(),
+      onLifecycle: (cb): Unsub => session.onLifecycle(cb),
+      updateGrants: (grants) => session.updateGrants(grants),
     };
   }
 
   closeAll(): void {
-    for (const s of [...this.peers.keys()]) s.close();
+    for (const s of [...this.peers.keys()]) s.close("node_closed");
   }
 
   peerStats(): { peerId: string; state: string; dirtyStreams: number; queuedData: number }[] {
@@ -282,7 +292,7 @@ export class SyncEngine {
         code: "ERR_ENTRY_ENCODING",
         detail: `HAVE reassembly exceeds MAX_REASSEMBLY_BYTES (req ${m.req})`,
       });
-      ps.session.close();
+      ps.session.close("protocol");
       return;
     }
     ps.havePages.set(m.page, m);

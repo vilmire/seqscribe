@@ -8,6 +8,7 @@ import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
 import { jcs } from "./encoding.js";
 import { misuse } from "./errors.js";
+import type { PeerHandleExt, PeerLifecycleEvent } from "./session.js";
 import type {
   AuthorityHooks,
   Channel,
@@ -159,6 +160,20 @@ export function startFinalityLoop(
 export interface ReconnectHandle {
   stop(): void;
   current(): PeerHandle | null;
+  // P15: re-advertise on the live session (if any) AND make the new map the
+  // grants used by every future redial — updating only the session would
+  // silently regress to the attach-time grants on the next reconnect.
+  updateGrants(grants: Record<Topic, "full" | "serve" | "none">): void;
+}
+
+// P10: fired once consecutive HELLO timeouts reach `unresponsiveAfter` (and on
+// each further timeout) — a reachable endpoint that never speaks seqscribe,
+// e.g. a misclassified dashboard URL, which otherwise flaps attach → 5 s
+// timeout → redial forever with no signal. Return "stop" to suppress further
+// dialing; any other return keeps the default reconnect policy.
+export interface PeerUnresponsiveInfo {
+  peerId: string;
+  consecutiveHelloTimeouts: number;
 }
 
 // The host contract's reconnect obligation (§5.2 "host reconnects") in its
@@ -169,12 +184,21 @@ export function manageReconnect(
   o: {
     peerId: string;
     peerClass: "content" | "metadata";
-    grants: Record<Topic, "full" | "serve" | "none">;
+    // a function form is re-read at every dial — use it (or ReconnectHandle
+    // .updateGrants) when topics activate at runtime (proposals-v3.5 P14/P15)
+    grants:
+      | Record<Topic, "full" | "serve" | "none">
+      | (() => Record<Topic, "full" | "serve" | "none">);
     dial: () => Channel | Promise<Channel>;
     backoff?: { minMs?: number; maxMs?: number; factor?: number };
     timers?: Timers;
     rng?: () => number;
     onError?: (err: unknown) => void;
+    unresponsiveAfter?: number; // consecutive HELLO timeouts before onPeerUnresponsive; default 3
+    onPeerUnresponsive?: (info: PeerUnresponsiveInfo) => void | "stop";
+    // P16: the per-session lifecycle feed, forwarded with the attempt number.
+    // Replay semantics mean every attempt reports its "attached" too.
+    onEvent?: (e: PeerLifecycleEvent & { attempt: number }) => void;
   },
 ): ReconnectHandle {
   const timers = o.timers ?? defaultTimers;
@@ -182,11 +206,18 @@ export function manageReconnect(
   const minMs = o.backoff?.minMs ?? 500;
   const maxMs = o.backoff?.maxMs ?? 30_000;
   const factor = o.backoff?.factor ?? 2;
+  const unresponsiveAfter = o.unresponsiveAfter ?? 3;
 
   let stopped = false;
-  let handle: PeerHandle | null = null;
+  let handle: PeerHandleExt | null = null;
   let timer: unknown = null;
   let delay = minMs;
+  let attemptNo = 0;
+  let helloTimeouts = 0;
+  let grantsOverride: Record<Topic, "full" | "serve" | "none"> | null = null;
+
+  const resolveGrants = () =>
+    grantsOverride ?? (typeof o.grants === "function" ? o.grants() : o.grants);
 
   const schedule = (ms: number) => {
     if (stopped) return;
@@ -202,14 +233,37 @@ export function manageReconnect(
           ch.close();
           return;
         }
-        const h = node.attach(ch, { peerId: o.peerId, peerClass: o.peerClass, grants: o.grants });
+        // createSeqscribe nodes return the extended handle (proposals-v3.5 P16)
+        const h = node.attach(ch, {
+          peerId: o.peerId,
+          peerClass: o.peerClass,
+          grants: resolveGrants(),
+        }) as PeerHandleExt;
         handle = h;
-        h.onStateChange((s) => {
-          if (s === "ready") delay = minMs; // healthy session resets the backoff
-          if (s === "closed" && !stopped) {
+        const attempt = ++attemptNo;
+        h.onLifecycle((e) => {
+          o.onEvent?.({ ...e, attempt });
+          if (e.event === "ready") {
+            delay = minMs; // healthy session resets the backoff
+            helloTimeouts = 0; // ...and the P10 unresponsive count
+          }
+          if (e.event === "closed" && !stopped) {
             handle = null;
-            schedule(delay);
-            delay = Math.min(maxMs, delay * factor);
+            let suppress = false;
+            if (e.reason === "hello_timeout") {
+              helloTimeouts++;
+              if (o.onPeerUnresponsive && helloTimeouts >= unresponsiveAfter) {
+                const verdict = o.onPeerUnresponsive({
+                  peerId: o.peerId,
+                  consecutiveHelloTimeouts: helloTimeouts,
+                });
+                suppress = verdict === "stop";
+              }
+            }
+            if (!suppress) {
+              schedule(delay);
+              delay = Math.min(maxMs, delay * factor);
+            }
           }
         });
       } catch (err) {
@@ -229,6 +283,10 @@ export function manageReconnect(
       handle = null;
     },
     current: () => handle,
+    updateGrants(grants) {
+      grantsOverride = { ...grants };
+      handle?.updateGrants(grants);
+    },
   };
 }
 

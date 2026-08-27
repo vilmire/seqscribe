@@ -166,9 +166,16 @@ export class LogCore {
       ref?: EntryId;
     },
   ): Promise<EntryId> {
-    if (this.closed) throw new SeqscribeError("ERR_MISUSE", "node is closed");
-    this.topics.get(topic); // ERR_UNKNOWN_TOPIC before enqueue
-    assertJsonValue(payload);
+    // Preflight failures reject rather than throw (proposals-v3.5 P11): append
+    // promises Promise<EntryId>, so callers get ONE failure channel whether the
+    // check runs before or after enqueue (SPEC §14 error carriage).
+    try {
+      if (this.closed) throw new SeqscribeError("ERR_MISUSE", "node is closed");
+      this.topics.get(topic); // ERR_UNKNOWN_TOPIC before enqueue
+      assertJsonValue(payload);
+    } catch (e) {
+      return Promise.reject(e);
+    }
     return new Promise<EntryId>((resolve, reject) => {
       this.push({
         t: "append",

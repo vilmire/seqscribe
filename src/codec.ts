@@ -4,7 +4,17 @@
 import { assertJsonValue, jcs, utf8ByteLength } from "./encoding.js";
 import { SeqscribeError } from "./errors.js";
 import { HLC_C_LIMIT } from "./hlc.js";
-import type { Constants, LogEntry } from "./types.js";
+import type {
+  Constants,
+  EntryId,
+  Hlc,
+  JsonValue,
+  Key,
+  LogEntry,
+  Seq,
+  Topic,
+  WriterId,
+} from "./types.js";
 
 export const TOPIC_RE = /^[a-z0-9_.-]{1,128}$/;
 export const WRITER_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
@@ -101,6 +111,50 @@ export function validateEntry(e: unknown, constants: Constants): LogEntry {
   };
   assertEntrySize(entry, constants);
   return entry;
+}
+
+// The caller-known half of an append, for size estimation before the entry
+// exists (proposals-v3.5 P13). Register-helper writes stamp `causal`
+// themselves — include a representative causal here when estimating those.
+export interface AppendShape {
+  topic: Topic;
+  kind: string;
+  payload: JsonValue;
+  key?: Key;
+  causal?: [WriterId, Seq];
+  ref?: EntryId;
+}
+
+// 16 decimal digits — an upper bound on the JCS width of any safe-integer
+// seq/hlc field the library will ever mint
+const MAX_NUMERIC_FIELD = Number.MAX_SAFE_INTEGER;
+
+// Append-oriented entry-size estimation (proposals-v3.5 P13). assertEntrySize
+// measures the JCS bytes of the COMPLETE LogEntry, but an append caller does
+// not yet know the library-owned fields (writer, seq, hlc, chain). This
+// substitutes them: exact values wherever ctx supplies them, conservative
+// worst-case stand-ins otherwise (max-length writer, 16-digit seq/hlc; chain
+// is always exactly 64 hex chars) — so with full context the result equals
+// what assertEntrySize will measure, and without it the result is a
+// monotone upper bound. Compare against Constants.MAX_ENTRY_BYTES;
+// assertEntrySize at apply time remains authoritative.
+export function estimateEntryBytes(
+  shape: AppendShape,
+  ctx?: { writer?: WriterId; seq?: Seq; hlc?: Hlc },
+): number {
+  const entry: LogEntry = {
+    topic: shape.topic,
+    writer: ctx?.writer ?? "W".repeat(128),
+    seq: ctx?.seq ?? MAX_NUMERIC_FIELD,
+    hlc: ctx?.hlc ?? { l: MAX_NUMERIC_FIELD, c: MAX_NUMERIC_FIELD },
+    kind: shape.kind,
+    ...(shape.key !== undefined ? { key: shape.key } : {}),
+    ...(shape.causal !== undefined ? { causal: shape.causal } : {}),
+    ...(shape.ref !== undefined ? { ref: shape.ref } : {}),
+    payload: shape.payload,
+    chain: "f".repeat(64),
+  };
+  return utf8ByteLength(jcs(entry as unknown as JsonValue));
 }
 
 // Entry ≤ MAX_ENTRY_BYTES, measured over the canonical (JCS) serialization —
