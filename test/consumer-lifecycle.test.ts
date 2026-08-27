@@ -284,3 +284,86 @@ describe("P21 — bounded read-only scans", () => {
     await node.close();
   });
 });
+
+describe("P25 — writer-form scans see the ring-retention memory tail", () => {
+  const RING = "t.ring";
+  const RING_POLICY: TopicPolicy = {
+    kind: "append",
+    retention: { mode: "ring", size: 3 },
+    replication: "subscribe-only",
+    access: "content",
+  };
+
+  async function ringNode(sched: Scheduler): Promise<SeqscribeNodeExt> {
+    const node = makeNode(sched);
+    node.defineTopic(RING, RING_POLICY);
+    return node;
+  }
+
+  async function appendRing(sched: Scheduler, node: SeqscribeNodeExt, n: number): Promise<void> {
+    for (let i = 0; i < n; i++) void node.log(RING).append("tick", { i });
+    await sched.run({ untilMs: sched.now() + 200 });
+  }
+
+  it("returns the ring tail a ring topic is currently holding (was an empty page)", async () => {
+    const sched = new Scheduler(0);
+    const node = await ringNode(sched);
+    await appendRing(sched, node, 1);
+
+    // the exact ADHDev Phase 4 Stage 3 probe: vector says seq 1 is here, and
+    // before P25 the scan returned { entries: [], truncatedBelow: true }
+    const one = node.scanEntries(RING, { writer: "wA", fromSeq: 1, toSeq: 1, limit: 1 });
+    expect(one.entries.map((e) => e.seq)).toEqual([1]);
+    expect(one.entries[0]!.payload).toEqual({ i: 0 });
+    expect(one.complete).toBe(true);
+    expect(one.truncatedBelow).toBe(false);
+
+    // and the default (unbounded) form covers the whole live tail
+    const all = node.scanEntries(RING, { writer: "wA" });
+    expect(all.entries.map((e) => e.seq)).toEqual([1]);
+    await node.close();
+  });
+
+  it("truncatedBelow reports rows the ring has already evicted", async () => {
+    const sched = new Scheduler(0);
+    const node = await ringNode(sched);
+    await appendRing(sched, node, 5); // size 3 → seqs 3,4,5 retained
+
+    const tail = node.scanEntries(RING, { writer: "wA" });
+    expect(tail.entries.map((e) => e.seq)).toEqual([3, 4, 5]);
+    expect(tail.complete).toBe(true);
+    expect(tail.truncatedBelow).toBe(true); // seqs 1-2 were evicted
+
+    // a window fully inside the live tail is not truncated
+    const live = node.scanEntries(RING, { writer: "wA", fromSeq: 4 });
+    expect(live.entries.map((e) => e.seq)).toEqual([4, 5]);
+    expect(live.truncatedBelow).toBe(false);
+
+    // a window fully below the tail: nothing held, and the loss is declared
+    const gone = node.scanEntries(RING, { writer: "wA", fromSeq: 1, toSeq: 2 });
+    expect(gone.entries).toEqual([]);
+    expect(gone.complete).toBe(true);
+    expect(gone.truncatedBelow).toBe(true);
+
+    // limit still bounds the page by seq window, same as any writer scan
+    const page = node.scanEntries(RING, { writer: "wA", fromSeq: 3, limit: 2 });
+    expect(page.entries.map((e) => e.seq)).toEqual([3, 4]);
+    expect(page.complete).toBe(false);
+    expect(page.nextFromSeq).toBe(5);
+    await node.close();
+  });
+
+  it("leaves full-retention writer scans untouched", async () => {
+    const sched = new Scheduler(0);
+    const node = await ringNode(sched);
+    await appendN(sched, node, 4);
+    await appendRing(sched, node, 2);
+
+    // the ring tail belongs to its own topic — it must not leak into T
+    const full = node.scanEntries(T, { writer: "wA" });
+    expect(full.entries.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
+    expect(full.complete).toBe(true);
+    expect(full.truncatedBelow).toBe(false);
+    await node.close();
+  });
+});

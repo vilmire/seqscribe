@@ -38,10 +38,11 @@ import type {
   WriterId,
 } from "./types.js";
 
-// Bounded read-only inspection (proposals-v3.5 P21). Two mutually exclusive
-// forms: canonical total-order (`after`/`through` Orders — pin `through` via
-// headOrder() so both sides of a comparison share one closed interval) and
-// per-writer seq range (`writer` + fromSeq/toSeq — spans the cold archive).
+// Bounded read-only inspection (proposals-v3.5 P21, P25). Two mutually
+// exclusive forms: canonical total-order (`after`/`through` Orders — pin
+// `through` via headOrder() so both sides of a comparison share one closed
+// interval) and per-writer seq range (`writer` + fromSeq/toSeq — spans the
+// cold archive and, for ring topics, the in-memory tail).
 // Never creates a durable cursor, never gates archiving.
 export interface ScanOptions {
   after?: Order; // canonical form: exclusive lower bound
@@ -57,7 +58,8 @@ export interface ScanResult {
   complete: boolean; // false = limit truncated the page; resume via nextAfter/nextFromSeq
   // the requested lower bound predates locally available retention: canonical
   // scans do not see cold-archived rows (§7.6), writer scans DO span the
-  // archive, so here it means rows below the first locally held seq
+  // archive and the ring tail (P25), so here it means rows below the first
+  // locally held seq — for a ring topic, below what the ring still holds
   truncatedBelow: boolean;
   nextAfter?: Order; // canonical form resume token
   nextFromSeq?: Seq; // writer form resume token
@@ -362,6 +364,14 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
       for (const e of store.archivedEntries(topic, o.writer, fromSeq, windowEnd)) bySeq.set(e.seq, e);
       for (const { entry } of store.entriesRange(topic, o.writer, fromSeq, windowEnd))
         bySeq.set(entry.seq, entry);
+      // P25 — a ring-retention topic's live entries are the in-memory tail and
+      // nothing else: persist() writes no sq_log/sq_archive row for them
+      // (§14). Merging the tail as a third source keeps the seq-keyed dedup
+      // and window bounds of the two durable sources above, so no new merge
+      // semantics appear; without it a ring scan returns an empty page while
+      // the stream head says the seq is locally present.
+      for (const e of core.ringTail(topic))
+        if (e.writer === o.writer && e.seq >= fromSeq && e.seq <= windowEnd) bySeq.set(e.seq, e);
       const entries = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
       const complete = windowEnd >= toSeq;
       const firstAvail = entries[0]?.seq;
