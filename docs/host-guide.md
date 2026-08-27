@@ -157,6 +157,7 @@ Wire `onAnomaly` into your alerting with roughly this triage:
 | `clock_outlier` | warn | a peer's clock is broken (> ε); also alarm on `hlc.l − now > CLOCK_WARN_MS` locally |
 | `owned_violation`, `takeover_invalid` | warn | misconfigured writer or attempted overreach |
 | `consumer_abandoned` | warn | a consumer slept past the window and lost its place |
+| `sync_stalled` | warn | WANT rounds toward a peer stopped progressing (v3.5-P22) — typically the peer serves rows your finality certificate rejects (voided rows, a pre-finality build's leftovers); check `stats().topics[t].applyRejects` for the reject histogram and `stats().peers[].stalledStreams`. The stream retries at anti-entropy cadence; resolution usually needs the peer repaired or re-based |
 | `delta_mismatch`, `view_faulted` | error (dev) | a ViewDef bug — delta disagrees with rows(), or a row violates limits; fix the definition, rebuild |
 
-Baseline metrics worth exporting: per-topic fgen age (finality staleness), per-writer contig lag vs. fleet max, pending/quarantine table sizes, send-queue drop counts.
+Baseline metrics worth exporting: per-topic fgen age (finality staleness), per-writer contig lag vs. fleet max, pending/quarantine table sizes, send-queue drop counts, and (v3.5-P22) per-topic `applyRejects` counters plus per-peer `stalledStreams` — a growing `rejected_finality` count is the early signature of a peer serving rows your certificate voids.

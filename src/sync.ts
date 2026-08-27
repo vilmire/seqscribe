@@ -6,7 +6,7 @@
 import { validateEntry } from "./codec.js";
 import { utf8ByteLength } from "./encoding.js";
 import { SeqscribeError } from "./errors.js";
-import type { LogCore } from "./log.js";
+import type { ApplyResult, LogCore } from "./log.js";
 import type {
   ControlMsg,
   MsgDelta,
@@ -66,6 +66,11 @@ interface PeerState {
   wantQueue: { topic: Topic; writer: WriterId }[];
   wantedStreams: Set<string>;
   recoveryProgress: Map<string, number>;
+  // P22 non-progress detection for the finality branch: contigSeq observed at
+  // the last WANT completion per stream; a completed round that moved nothing
+  // must not re-queue immediately (the pre-finality-reject spin)
+  syncProgress: Map<string, number>;
+  stalled: Set<string>;
   antiEntropyTimer: unknown;
   probes: Map<string, (res: MsgProbeRes) => void>;
   // last-known peer stream heads (from HAVE rounds, received ENTRIES, and our
@@ -91,6 +96,10 @@ export interface SyncEngineOpts {
 export class SyncEngine {
   private readonly o: SyncEngineOpts;
   private readonly peers = new Map<Session, PeerState>();
+  // P22 observability: cumulative non-applied wire-apply outcomes per topic
+  // (rejected_finality, sealed, forked, dropped_overflow, error) — the spin
+  // was invisible precisely because rejects were silently discarded
+  private readonly rejects = new Map<Topic, Record<string, number>>();
   private finalityHub: FinalityHub | null = null;
   private subHub: SubHub | null = null;
   private directiveHub: DirectiveHub | null = null;
@@ -208,6 +217,8 @@ export class SyncEngine {
       wantQueue: [],
       wantedStreams: new Set(),
       recoveryProgress: new Map(),
+      syncProgress: new Map(),
+      stalled: new Set(),
       antiEntropyTimer: null,
       probes: new Map(),
       known: new Map(),
@@ -230,13 +241,24 @@ export class SyncEngine {
     for (const s of [...this.peers.keys()]) s.close("node_closed");
   }
 
-  peerStats(): { peerId: string; state: string; dirtyStreams: number; queuedData: number }[] {
+  peerStats(): {
+    peerId: string;
+    state: string;
+    dirtyStreams: number;
+    queuedData: number;
+    stalledStreams: number;
+  }[] {
     return [...this.peers.values()].map((ps) => ({
       peerId: ps.session.peerId,
       state: ps.session.state(),
       dirtyStreams: ps.dirty.size,
       queuedData: ps.session.queuedData(),
+      stalledStreams: ps.stalled.size,
     }));
+  }
+
+  rejectStats(topic: Topic): Record<string, number> {
+    return { ...(this.rejects.get(topic) ?? {}) };
   }
 
   // ---- lifecycle ----
@@ -696,7 +718,7 @@ export class SyncEngine {
     if (!ps.session.mutualFull(m.topic)) return; // ACL re-verified on receive (§5.4)
     const key = `${m.topic}\u0000${m.writer}`;
     if ((ps.known.get(key) ?? 0) < m.toSeq) ps.known.set(key, m.toSeq); // the sender holds ≥ toSeq
-    const applies: Promise<unknown>[] = [];
+    const applies: Promise<ApplyResult | "error">[] = [];
     for (const raw of m.entries) {
       let entry: LogEntry;
       try {
@@ -707,9 +729,20 @@ export class SyncEngine {
         continue;
       }
       if (entry.topic !== m.topic || entry.writer !== m.writer) continue;
-      applies.push(this.o.core.applyExternal(entry, ps.session.peerId).catch(() => undefined));
+      applies.push(
+        this.o.core.applyExternal(entry, ps.session.peerId).catch(() => "error" as const),
+      );
     }
-    void Promise.all(applies).then(() => {
+    void Promise.all(applies).then((results) => {
+      // P22 point 2/4: apply outcomes are no longer discarded — non-applied
+      // outcomes feed the per-topic reject counters stats() exposes, so an
+      // all-rejected round is visible instead of symptomless
+      for (const r of results) {
+        if (r === "applied" || r === "duplicate" || r === "pending") continue;
+        const rec = this.rejects.get(m.topic) ?? {};
+        rec[r] = (rec[r] ?? 0) + 1;
+        this.rejects.set(m.topic, rec);
+      }
       if (m.req !== undefined && m.done) {
         const want = ps.activeWants.get(m.req);
         this.finishWant(ps, m.req);
@@ -717,12 +750,12 @@ export class SyncEngine {
         if (want) {
           const head = this.o.core.getStream(m.topic, m.writer);
           const target = this.o.core.recoveryTarget(m.topic, m.writer);
+          const skey = `${m.topic} ${m.writer}`;
           if (target) {
             // absorbing-state detection: a round that made no progress means this
             // peer cannot supply the canonical range (§12 step 3)
-            const key = `${m.topic} ${m.writer}`;
-            const before = ps.recoveryProgress.get(key);
-            ps.recoveryProgress.set(key, head.contigSeq);
+            const before = ps.recoveryProgress.get(skey);
+            ps.recoveryProgress.set(skey, head.contigSeq);
             if (before !== undefined && before >= head.contigSeq)
               this.o.core.reportCanonicalUnavailable(m.topic, m.writer);
             else this.queueWant(ps, m.topic, m.writer); // keep pulling toward finalSeq
@@ -732,7 +765,32 @@ export class SyncEngine {
             const cert = this.o.core.getCert(m.topic);
             const awaitingSnapshot =
               cert !== null && (cert.cut[m.writer]?.seq ?? 0) > head.contigSeq;
-            if (!awaitingSnapshot) this.queueWant(ps, m.topic, m.writer);
+            if (!awaitingSnapshot) {
+              // P22: the finality branch gets the same absorbing-state
+              // discipline as the recovery branch. A completed round that
+              // moved contigSeq nothing (e.g. every entry pre_finality_
+              // rejected against a live cert) must NOT re-queue at zero
+              // delay — that was the production spin: WANT → full-window
+              // ENTRIES → reject-all → WANT, tight-looping on both ends.
+              // The stream stalls instead: re-WANT happens only when a HAVE
+              // round / cert / adoption event re-queues it (all timer- or
+              // event-paced), and a round that DOES progress clears the stall.
+              const before = ps.syncProgress.get(skey);
+              ps.syncProgress.set(skey, head.contigSeq);
+              if (before !== undefined && before >= head.contigSeq) {
+                if (!ps.stalled.has(skey)) {
+                  ps.stalled.add(skey);
+                  this.o.emitAnomaly({ kind: "sync_stalled" });
+                }
+              } else {
+                ps.stalled.delete(skey);
+                this.queueWant(ps, m.topic, m.writer);
+              }
+            }
+          } else {
+            // caught up (or sealed) — forget the progress watermark
+            ps.syncProgress.delete(skey);
+            ps.stalled.delete(skey);
           }
         }
       }

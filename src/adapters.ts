@@ -24,9 +24,26 @@ export interface LockDbLike {
 
 export function betterSqlite3Handle(db: BetterSqlite3Like, lockDb?: LockDbLike): SqliteHandle {
   let owned = false;
+  // Statement cache (proposals-v3.5 P23): every store operation used to
+  // re-prepare its SQL — Statement::JS_new was a visible fraction of the P22
+  // incident's per-round cost, and it taxes every healthy hot path too. SQLite
+  // prepared statements (v2 semantics) recompile themselves on schema change,
+  // so the cache needs no invalidation hook. The SQL census is finite (fixed
+  // store paths + per-topic/view table names); the cap is a guard against
+  // pathological dynamic SQL, not an LRU — a full clear just re-prepares.
+  const stmts = new Map<string, ReturnType<BetterSqlite3Like["prepare"]>>();
+  const prep = (sql: string) => {
+    let s = stmts.get(sql);
+    if (s === undefined) {
+      if (stmts.size >= 512) stmts.clear();
+      s = db.prepare(sql);
+      stmts.set(sql, s);
+    }
+    return s;
+  };
   return {
     run(sql, params = []) {
-      const stmt = db.prepare(sql);
+      const stmt = prep(sql);
       if (stmt.reader) {
         stmt.all(...params);
         return { changes: 0, lastInsertRowid: 0 };
@@ -35,10 +52,10 @@ export function betterSqlite3Handle(db: BetterSqlite3Like, lockDb?: LockDbLike):
       return { changes: r.changes, lastInsertRowid: r.lastInsertRowid };
     },
     get<T>(sql: string, params: unknown[] = []) {
-      return db.prepare(sql).get(...params) as T | undefined;
+      return prep(sql).get(...params) as T | undefined;
     },
     all<T>(sql: string, params: unknown[] = []) {
-      return db.prepare(sql).all(...params) as T[];
+      return prep(sql).all(...params) as T[];
     },
     transaction(fn) {
       return db.transaction(fn)();

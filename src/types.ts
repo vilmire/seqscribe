@@ -306,7 +306,8 @@ export interface Anomaly {
     | "delta_mismatch"
     | "view_faulted"
     | "consumer_abandoned"
-    | "canonical_unavailable";
+    | "canonical_unavailable"
+    | "sync_stalled"; // extension (proposals-v3.5 P22): WANT rounds toward a peer stopped progressing
   entry?: LogEntry;
 }
 

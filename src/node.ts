@@ -77,9 +77,18 @@ export interface NodeStats {
       finalityGeneration: number | null;
       certOrderAgeMs: number | null;
       consumers: Record<string, { lastRowid: number; lagRows: number }>;
+      // cumulative non-applied wire-apply outcomes (proposals-v3.5 P22) —
+      // rejected_finality / sealed / forked / dropped_overflow / error
+      applyRejects: Record<string, number>;
     }
   >;
-  peers: { peerId: string; state: string; dirtyStreams: number; queuedData: number }[];
+  peers: {
+    peerId: string;
+    state: string;
+    dirtyStreams: number;
+    queuedData: number;
+    stalledStreams: number; // P22 — streams suspended for non-progress
+  }[];
 }
 
 export interface SeqscribeNodeExt extends SeqscribeNode {
@@ -396,6 +405,7 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
         finalityGeneration: cert?.generation ?? null,
         certOrderAgeMs: cert ? Math.max(0, now - cert.order.l) : null,
         consumers,
+        applyRejects: sync.rejectStats(topic),
       };
     }
     return out;
