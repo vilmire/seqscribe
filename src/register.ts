@@ -23,6 +23,7 @@ import type {
   OwnedRequest,
   RegisterHandle,
   RegisterSnapshotState,
+  Seq,
   Timers,
   Topic,
   Unsub,
@@ -191,6 +192,43 @@ export class RegisterHub {
 
   ownerOf(topic: Topic, key: Key): WriterId | null {
     return this.topicState(topic).keys.get(key)?.owner ?? null;
+  }
+
+  // §5.7 pre-write warning source (proposals-v3.5 P27): the latest change this
+  // node knows about per key, as the [writer, seq] shape BeaconReport.hints
+  // declares. Sourced from the MATERIALIZED winner, NOT from scopeTails —
+  // scopeTails is the §11.2 own-uncommitted tail and is deleted as each own
+  // write materializes (and never holds a peer's write at all), so it is empty
+  // in exactly the steady state a hint has to describe. `winner` is the fold's
+  // per-key judgment over the total order, which is what "latest known change
+  // to this key" means, and it covers peer writes and own writes alike.
+  //
+  // Member-only keys (a set with no scalar winner) report their highest member
+  // entry: under §11.5 mirror rules such a key never has a `winner`, but an
+  // add/remove is still a change a concurrent editor would overwrite.
+  hintsFor(topic: Topic): Record<string, [WriterId, Seq]> {
+    const out: Record<string, [WriterId, Seq]> = {};
+    for (const [key, ks] of this.topicState(topic).keys) {
+      // Rank by the total order, NEVER by raw seq: seq is per (topic, writer),
+      // so `s > best[1]` across different writers compares unrelated counters
+      // and can pick a stale entry from a high-seq writer over the genuinely
+      // latest change — which would then make staleness()'s haveLocally test
+      // the wrong writer's stream entirely. Every other comparison in the fold
+      // uses orderCompare for this reason.
+      let best: [WriterId, Seq] | undefined;
+      let bestOrder: Order | undefined;
+      if (ks.winner && ks.winnerOrder) {
+        best = [ks.winner[1], ks.winner[2]];
+        bestOrder = ks.winnerOrder;
+      }
+      for (const ms of ks.members.values()) {
+        if (bestOrder !== undefined && orderCompare(ms.order, bestOrder) <= 0) continue;
+        best = [ms.entry[1], ms.entry[2]];
+        bestOrder = ms.order;
+      }
+      if (best) out[key] = best;
+    }
+    return out;
   }
 
   pendingRequests(topic: Topic, now?: number): OwnedRequest[] {

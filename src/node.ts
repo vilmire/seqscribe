@@ -2,7 +2,7 @@
 // from the hubs (log core, sync, views, consumers, finality, subscriptions,
 // registers, directives, snapshots, beacon).
 
-import { BeaconHub } from "./beacon.js";
+import { BeaconHub, type BeaconStartOpts } from "./beacon.js";
 import { assertWriter } from "./codec.js";
 import { ConsumerHub, type ConsumerInfo, type ConsumerResetResult } from "./consume.js";
 import { orderCompare, orderOf } from "./hlc.js";
@@ -23,7 +23,9 @@ import { ViewHub } from "./views.js";
 import type { PeerHandleExt } from "./session.js";
 import type {
   Anomaly,
+  BeaconHandle,
   BeaconReport,
+  BeaconTransport,
   Channel,
   CreateOpts,
   EntryId,
@@ -117,6 +119,11 @@ export interface SeqscribeNodeExt extends SeqscribeNode {
   // Bounded inspection (P21)
   scanEntries(topic: Topic, o?: ScanOptions): ScanResult;
   headOrder(topic: Topic): Order | null; // pin scan `through` / comparison heads
+  // §5.7 hint supply (proposals-v3.5 P27, a v3.6-cycle extension). The ratified
+  // §14 `beacon(t)` is unchanged and still complete on its own; this overload
+  // only adds the optional host-supplied hints callback, so existing callers
+  // and the base SeqscribeNode contract are untouched.
+  beacon(t: BeaconTransport, o?: BeaconStartOpts): BeaconHandle;
   // The handle attach really returns (proposals-v3.5 P15/P16): the SPEC §14
   // PeerHandle plus reasoned lifecycle and runtime grant re-advertisement.
   attach(
@@ -237,7 +244,17 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
   sync.setSnapshotHub(snapshots);
   const archive = new ArchiveHub({ core, store, topics, views, registers, constants, clock, emitAnomaly });
   consumers.setOnAdvance((topic) => archive.onConsumerAdvance(topic));
-  const beaconHub = new BeaconHub({ core, topics, writerId: opts.writerId, constants, timers, clock });
+  // registers is passed so the beacon can source §5.7 hints from the register
+  // fold for hintKeys-opted topics without host involvement (P27)
+  const beaconHub = new BeaconHub({
+    core,
+    topics,
+    writerId: opts.writerId,
+    constants,
+    timers,
+    clock,
+    registers,
+  });
   finalityHub.setOnAccepted((cert) => {
     // §7.5c: certificate effects can rewrite covered history — recompute views
     views.notifyApplied(cert.topic);
@@ -295,7 +312,7 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
 
     setKnownVectors: (v: BeaconReport[]) => beaconHub.setKnownVectors(v),
     staleness: (topic, key) => beaconHub.staleness(topic, key),
-    beacon: (t) => beaconHub.start(t),
+    beacon: (t: BeaconTransport, o?: BeaconStartOpts) => beaconHub.start(t, o),
 
     finality: (topic) => finalityHub.finality(topic),
     proposeFinality: (topic) => finalityHub.proposeFinality(topic),

@@ -1,8 +1,10 @@
 // SPEC §5.7 (DESIGN), §14 — beacon client: debounced content-free vector
 // reports plus node-side staleness prediction from known vectors.
 
+import { sha256HexUtf8 } from "./encoding.js";
 import { misuse } from "./errors.js";
 import type { LogCore } from "./log.js";
+import type { RegisterHub } from "./register.js";
 import type { TopicRegistry } from "./topics.js";
 import type {
   BeaconHandle,
@@ -10,11 +12,23 @@ import type {
   BeaconTransport,
   Constants,
   Key,
+  Seq,
   Staleness,
   Timers,
   Topic,
   WriterId,
 } from "./types.js";
+
+// §5.7 pre-write warning (proposals-v3.5 P27). `hints` advertises, per key, the
+// latest change this node knows about — the reader side (staleness(topic, key))
+// has always existed, but nothing ever produced the field, so the feature could
+// not fire. Two supply paths, not mutually exclusive: the host's callback (any
+// topic, any key shape) and the library's own register fold (opt-in per topic
+// via TopicPolicy.hintKeys).
+export type HintMap = Record<Topic, Record<string, [WriterId, Seq]>>;
+export interface BeaconStartOpts {
+  hints?: () => HintMap;
+}
 
 export interface BeaconHubDeps {
   core: LogCore;
@@ -23,6 +37,7 @@ export interface BeaconHubDeps {
   constants: Constants;
   timers: Timers;
   clock: () => number;
+  registers?: RegisterHub | undefined;
 }
 
 export class BeaconHub {
@@ -30,18 +45,21 @@ export class BeaconHub {
   private transport: BeaconTransport | null = null;
   private debounceTimer: unknown = null;
   private stopped = false;
+  private hostHints: (() => HintMap) | null = null;
 
   constructor(private readonly deps: BeaconHubDeps) {}
 
-  start(t: BeaconTransport): BeaconHandle {
+  start(t: BeaconTransport, o?: BeaconStartOpts): BeaconHandle {
     if (this.transport) throw misuse("beacon already started");
     this.transport = t;
+    this.hostHints = o?.hints ?? null;
     this.push(); // initial report; GET piggybacks on each push
     return {
       stop: () => {
         this.stopped = true;
         if (this.debounceTimer !== null) this.deps.timers.clearTimeout(this.debounceTimer);
         this.transport = null;
+        this.hostHints = null;
       },
     };
   }
@@ -103,6 +121,62 @@ export class BeaconHub {
     return out;
   }
 
+  // §5.7 hints (P27). `hintKeys` is the per-topic opt-in gate: a topic that has
+  // not set it contributes nothing and, if the host names it anyway, is dropped
+  // — the SPEC wire format implies the gate, and honoring it is what stops a
+  // "hash" declaration from leaking plaintext keys by omission.
+  //   "plain" — the key as authored
+  //   "hash"  — sha256 hex of the key, so a board operator sees change activity
+  //             without learning key names
+  // Host-supplied entries are merged OVER library-derived ones for the same
+  // topic: the host asked for a specific advertisement, so it wins.
+  private buildHints(): HintMap | undefined {
+    const out: HintMap = {};
+    // The opt-in gate, resolved BEFORE any hint is computed: a topic that has
+    // not set hintKeys must cost nothing on the push path (P27 item 3), so an
+    // opted-out register topic is never walked at all.
+    const modeOf = (topic: Topic): "plain" | "hash" | undefined => {
+      try {
+        return this.deps.topics.get(topic).policy.hintKeys;
+      } catch {
+        return undefined; // a host naming an undefined topic contributes nothing
+      }
+    };
+    const add = (topic: Topic, mode: "plain" | "hash", raw: Record<string, [WriterId, Seq]>): void => {
+      const dst = (out[topic] ??= {});
+      for (const [key, at] of Object.entries(raw))
+        dst[mode === "hash" ? sha256HexUtf8(key) : key] = at;
+    };
+
+    const registers = this.deps.registers;
+    if (registers)
+      for (const topic of this.deps.topics.list()) {
+        const mode = modeOf(topic);
+        if (mode === undefined) continue; // not opted in — never computed
+        if (this.deps.topics.get(topic).policy.kind !== "register") continue;
+        add(topic, mode, registers.hintsFor(topic));
+      }
+
+    if (this.hostHints) {
+      let supplied: HintMap;
+      try {
+        supplied = this.hostHints();
+      } catch {
+        supplied = {}; // a throwing host callback must not break the report
+      }
+      for (const [topic, raw] of Object.entries(supplied)) {
+        const mode = modeOf(topic);
+        if (mode === undefined) continue; // gate applies to the host path too
+        add(topic, mode, raw); // incl. hashing — a host cannot bypass "hash"
+      }
+    }
+
+    // An empty map stays ABSENT, not `{}` — a node that opts into nothing emits
+    // byte-identical reports to pre-P27 (item 3).
+    for (const topic of Object.keys(out)) if (Object.keys(out[topic]!).length === 0) delete out[topic];
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
   private push(): void {
     const t = this.transport;
     if (!t || this.stopped) return;
@@ -111,6 +185,8 @@ export class BeaconHub {
       at: new Date(this.deps.clock()).toISOString(),
       vectors: this.deps.core.vectors(),
     };
+    const hints = this.buildHints();
+    if (hints) report.hints = hints;
     void t
       .put(report)
       .then(() => t.get())
@@ -161,10 +237,92 @@ export interface FetchRequestLike {
   json(): Promise<unknown>;
 }
 
+// Optional board persistence (proposals-v3.5 P26). A Durable Object is the host
+// the comment above recommends, but a DO is not a persistent process: an idle
+// one hibernates and its isolate is evicted, so the closure `board` below resets
+// to empty on the next wake — every vector every node ever PUT, gone silently.
+//
+// Granularity is PER-ACCOUNT, matching the existing `board.get(account)`
+// granularity: an account's report set is one BeaconReport per active node, and
+// a POST already overwrites a whole node entry ("one report per node"), so a
+// per-account read-modify-write mirrors the in-memory semantics exactly and
+// needs no merge logic. Finer (per-node) rows would buy nothing here and would
+// add write coordination; a single whole-board blob would couple accounts.
+// A host whose storage has a per-value size limit (e.g. a DO's 128 KiB) shards
+// inside its own adapter — that is a storage detail, not a contract change.
+export interface BeaconBoardStore {
+  load(account: string): Promise<Record<string, BeaconReport> | null>; // node → report
+  save(account: string, board: Record<string, BeaconReport>): Promise<void>;
+}
+
 export function beaconFetchHandler(o?: {
   token?: string;
+  store?: BeaconBoardStore;
 }): (req: FetchRequestLike) => Promise<{ status: number; body: string }> {
   const board = new Map<string, Map<string, BeaconReport>>(); // account → node → report
+  // Accounts already seeded from the store this isolate's lifetime. Without a
+  // store this stays empty and nothing below it ever runs.
+  const hydrated = new Set<string>();
+  // One in-flight hydration per account: concurrent first requests must not
+  // each issue their own load and clobber one another's seed.
+  const hydrating = new Map<string, Promise<void>>();
+
+  const hydrate = async (account: string): Promise<void> => {
+    const store = o?.store;
+    if (!store || hydrated.has(account)) return;
+    let p = hydrating.get(account);
+    if (!p) {
+      p = (async () => {
+        try {
+          const saved = await store.load(account);
+          if (saved) {
+            // Merge UNDER anything this isolate already accepted: a POST that
+            // landed while the load was in flight is newer than what the store
+            // held when it was read, so it must not be overwritten by the seed.
+            const acct = board.get(account) ?? new Map<string, BeaconReport>();
+            for (const [node, report] of Object.entries(saved))
+              if (!acct.has(node)) acct.set(node, report);
+            board.set(account, acct);
+          }
+          hydrated.add(account);
+        } catch {
+          // A failed load is not a serving failure — the board is advisory,
+          // self-healing data (§5.7): nodes re-PUT their own current vector on
+          // their own debounce cycle, so an un-seeded board refills on its own.
+          // Deliberately NOT marked hydrated: the next request retries the load.
+        } finally {
+          hydrating.delete(account);
+        }
+      })();
+      hydrating.set(account, p);
+    }
+    await p;
+  };
+
+  // Tail of the in-flight save chain per account. Each link snapshots the board
+  // when its own turn comes, so the last write to commit is the newest state.
+  const saveChain = new Map<string, Promise<void>>();
+  const saveSerialized = (
+    store: BeaconBoardStore,
+    account: string,
+    acct: Map<string, BeaconReport>,
+  ): Promise<void> => {
+    const prev = saveChain.get(account) ?? Promise.resolve();
+    const next = prev.then(async () => {
+      try {
+        // snapshot HERE, not at enqueue time — see the call site
+        await store.save(account, Object.fromEntries(acct));
+      } catch {
+        // a failed save never fails the request (see the call site)
+      }
+    });
+    saveChain.set(account, next);
+    void next.finally(() => {
+      if (saveChain.get(account) === next) saveChain.delete(account);
+    });
+    return next;
+  };
+
   return async (req) => {
     if (o?.token !== undefined && req.headers.get("authorization") !== `Bearer ${o.token}`)
       return { status: 401, body: "" };
@@ -176,20 +334,37 @@ export function beaconFetchHandler(o?: {
     if (!m) return { status: 404, body: "" };
     const account = decodeURIComponent(m[1]!);
     if (req.method === "GET") {
+      await hydrate(account);
       const reports = [...(board.get(account)?.values() ?? [])];
       return { status: 200, body: JSON.stringify(reports) };
     }
     if (req.method === "POST") {
+      let acct: Map<string, BeaconReport>;
       try {
         const report = (await req.json()) as BeaconReport;
         if (typeof report.node !== "string") throw new Error("bad report");
-        const acct = board.get(account) ?? new Map<string, BeaconReport>();
+        await hydrate(account);
+        acct = board.get(account) ?? new Map<string, BeaconReport>();
         acct.set(report.node, report); // one report per node, overwrite (§14)
         board.set(account, acct);
-        return { status: 204, body: "" };
       } catch {
         return { status: 400, body: "" };
       }
+      // Write-through, but never at the cost of the request: a save failure
+      // leaves this isolate's board updated and still answers 204. Vectors are
+      // advisory and self-healing, so a lost write degrades staleness estimates
+      // for one debounce cycle — it cannot corrupt sync, block a write, or lose
+      // durable log data. Over-engineering transactional guarantees here would
+      // buy nothing the data's own design doesn't already provide.
+      //
+      // Saves for one account are SERIALIZED, and each snapshots the board at
+      // its own turn rather than at enqueue time. Concurrent POSTs otherwise
+      // race: two overlapping saves can commit out of order and leave the store
+      // holding the OLDER snapshot, so a node that was acknowledged with a 204
+      // is missing after the next hibernation — a lost write, not the tolerable
+      // "lost the last few seconds" this design accepts.
+      if (o?.store) await saveSerialized(o.store, account, acct);
+      return { status: 204, body: "" };
     }
     return { status: 405, body: "" };
   };

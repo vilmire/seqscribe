@@ -54,7 +54,14 @@ export type {
 } from "./session.js";
 export { validatePolicy, conflictPolicyFor } from "./topics.js";
 export { exportTopic, importTopic } from "./export.js";
-export { httpBeaconTransport, beaconFetchHandler, type FetchRequestLike } from "./beacon.js";
+export {
+  httpBeaconTransport,
+  beaconFetchHandler,
+  type FetchRequestLike,
+  type BeaconBoardStore,
+  type BeaconStartOpts,
+  type HintMap,
+} from "./beacon.js";
 export { webSocketChannel, dataChannelChannel, type WebSocketLike } from "./ws.js";
 export {
   betterSqlite3Handle,
