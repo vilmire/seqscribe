@@ -1,6 +1,6 @@
 # seqscribe host integration guide — the host's contract obligations
 
-> Status: **non-normative companion to SPEC v3.5** (2026-08-28). The SPEC deliberately pushes identity, trust, signing, and adjudication to the host; those obligations are stated where each mechanism is defined and are therefore scattered. This document collects them into one place, per host role, with runbooks for the situations where the host is the only actor that can act. Where this guide and the SPEC disagree, the SPEC wins. This is the *generic* host contract — ADHDev-specific integration lives in the ADHDev repo (DESIGN §9.5).
+> Status: **non-normative companion to SPEC v3.6** (2026-08-28). The SPEC deliberately pushes identity, trust, signing, and adjudication to the host; those obligations are stated where each mechanism is defined and are therefore scattered. This document collects them into one place, per host role, with runbooks for the situations where the host is the only actor that can act. Where this guide and the SPEC disagree, the SPEC wins. This is the *generic* host contract — ADHDev-specific integration lives in the ADHDev repo (DESIGN §9.5).
 
 ## 0. Helpers that implement this guide (src/host.ts)
 
@@ -19,7 +19,7 @@ Every obligation below remains yours, but the common shapes ship as helpers — 
 | `loadOrCreateWriterId(storage, {prefix})` | stable per-machine id persisted in sq_meta (clone/restore procedures must delete the row — see §7) |
 | `migrateLegacyJsonl(node, topic, lines, {kind})` | genesis migration of pre-seqscribe JSONL logs as fresh appends |
 | `webSocketChannel(ws)` (= `dataChannelChannel`) / `betterSqlite3Handle(db, lockDb?)` / `sqliteWasmHandle(db)` / `durableObjectSqlHandle(sql, txn)` | transport + storage adapters — the socket channel accepts WebSocket, RTCDataChannel, and `isOpen()` wrappers (v3.5-P4); `lockDb` enables the crash-safe cross-process owner lock |
-| `httpBeaconTransport(base, account, token?)` / `beaconFetchHandler({token})` | the §14 beacon wire, client and Workers/DO-deployable server |
+| `httpBeaconTransport(base, account, token?)` / `beaconFetchHandler({token, store?})` | the §14 beacon wire, client and Workers/DO-deployable server. **Pass `store` on a hibernating host** (a Durable Object): without it the board is closure state that an eviction silently empties (v3.6-P26). `node.beacon(t, {hints})` supplies §5.7a pre-write hints; register topics with `hintKeys` set are derived automatically (v3.6-P27). `stop()` is a pause — the same beacon can be re-armed on reconnect (v3.6-P28) |
 | `node.stats()` | the §8 monitoring baseline below, one call |
 
 ## 1. What the host must bring (before the first byte syncs)

@@ -113,3 +113,32 @@ describe("conflict policy resolution (§11.7)", () => {
     expect(conflictPolicyFor(policy, "securityX")).toBe("lww");
   });
 });
+
+// proposals-v3.5 P8 (ratified v3.6) — the §1 charter character classes admit
+// the literal name `__proto__`. The wire has always rejected it in record maps
+// (§5.4), but that left the name legal at the AUTHOR and IMPORT layers, which
+// is the half the v3.5 ratification recorded as explicitly deferred.
+describe("__proto__ is not a legal charter name (§1, P8)", () => {
+  it("defineTopic rejects the topic name __proto__", () => {
+    const reg = new TopicRegistry();
+    expect(() => reg.define("__proto__", appendFull)).toThrowError(SeqscribeError);
+    expect(() => reg.define("__proto__", appendFull)).toThrowError(/invalid topic/);
+    // and the registry's own map is untouched by the attempt
+    expect(({} as { kind?: unknown }).kind).toBeUndefined();
+  });
+
+  it("still accepts names that merely contain the reserved word", () => {
+    const reg = new TopicRegistry();
+    reg.define("__proto__x", appendFull);
+    reg.define("a.__proto__.b", appendFull);
+    expect(reg.list().sort()).toEqual(["__proto__x", "a.__proto__.b"]);
+  });
+
+  it("assertWriter rejects __proto__ but not lookalikes", async () => {
+    const { assertWriter, assertTopic } = await import("../src/codec.js");
+    expect(() => assertWriter("__proto__")).toThrowError(/invalid writer/);
+    expect(() => assertTopic("__proto__")).toThrowError(/invalid topic/);
+    expect(() => assertWriter("__proto__2")).not.toThrow();
+    expect(() => assertWriter("wA")).not.toThrow();
+  });
+});

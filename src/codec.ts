@@ -21,13 +21,24 @@ export const WRITER_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
 export const MAX_KEY_BYTES = 512;
 export const CHAIN_RE = /^[0-9a-f]{64}$/;
 
+// §1 charter exclusion (proposals-v3.5 P8, ratified v3.6). The character
+// classes above admit the literal name `__proto__`, and record maps keyed by
+// charter names are plain objects at most merge sites — an own `__proto__` key
+// becomes a prototype SET under index-assignment or Object.assign. The wire
+// already rejects it (§5.4 charter-key rule), but that left the name legal at
+// the AUTHOR and IMPORT layers, which is the half v3.5 recorded as deferred.
+// Excluded here rather than in the regexes so the published charter character
+// classes (and every hash that quotes them) stay exactly as specified — this
+// is a name exclusion, not a charset change, so no hash input moves.
+export const RESERVED_NAME = "__proto__";
+
 export function assertTopic(topic: unknown): asserts topic is string {
-  if (typeof topic !== "string" || !TOPIC_RE.test(topic))
+  if (typeof topic !== "string" || !TOPIC_RE.test(topic) || topic === RESERVED_NAME)
     throw new SeqscribeError("ERR_ENTRY_ENCODING", `invalid topic: ${String(topic)}`);
 }
 
 export function assertWriter(writer: unknown): asserts writer is string {
-  if (typeof writer !== "string" || !WRITER_RE.test(writer))
+  if (typeof writer !== "string" || !WRITER_RE.test(writer) || writer === RESERVED_NAME)
     throw new SeqscribeError("ERR_ENTRY_ENCODING", `invalid writer: ${String(writer)}`);
 }
 

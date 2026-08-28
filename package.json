@@ -1,7 +1,7 @@
 {
   "name": "seqscribe",
   "version": "0.1.0-dev.0",
-  "description": "Subscribe to sequences — writer-owned append-only log sync for SQLite. Implementation of SPEC v3.5; not yet released.",
+  "description": "Subscribe to sequences — writer-owned append-only log sync for SQLite. Implementation of SPEC v3.6; not yet released.",
   "license": "FSL-1.1-Apache-2.0 OR AGPL-3.0-only",
   "repository": {
     "type": "git",

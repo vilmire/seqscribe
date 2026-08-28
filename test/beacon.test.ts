@@ -305,6 +305,33 @@ describe("beacon hints (§5.7 pre-write warning, P27)", () => {
     await a.close();
   });
 
+  it("a member op newer than the scalar winner becomes the hint", async () => {
+    // §11.6 has the key-level winner track the latest effective op on the key
+    // INCLUDING member ops (that is what lets member-only keys carry a winner
+    // in snapshot state), so a hint must follow the add here — not the scalar
+    // set that the §11.5 mirror rule left behind as the key's last value.
+    const sched = new Scheduler(0);
+    const { transport, board } = memoryBeacon();
+    const a = regNode(sched, "wA", "plain");
+    const setId = await (async () => {
+      const p = a.register(REG).set("k", { v: 1 });
+      await sched.run({ untilMs: 200 });
+      return p;
+    })();
+    const addId = await (async () => {
+      const p = a.register(REG).add("k", "m1");
+      await sched.run({ untilMs: 1_000 });
+      return p;
+    })();
+    expect(addId[2]).toBeGreaterThan(setId[2]); // the add really is later
+
+    a.beacon(transport);
+    await sched.run({ untilMs: 12_000 });
+    const hint = board.get("wA")!.hints![REG]!["k"]!;
+    expect(hint[1]).toBe(addId[2]); // the member op, not the stale scalar winner
+    await a.close();
+  });
+
   it("ranks a key's latest change by total order, not by raw per-writer seq", async () => {
     // seq is per (topic, writer): a HIGH-seq entry from one writer is not newer
     // than a LOW-seq entry from another. This bites on the member path, where a
