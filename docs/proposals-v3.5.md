@@ -1,6 +1,13 @@
-# Proposed SPEC amendments — v3.5 candidates (pending owner stamp)
+# SPEC amendments — v3.5 (P1–P25)
 
-> Status: **proposals only — not normative** (2026-08-26). Surfaced while preparing the ADHDev integration surface. The implementation ships all three as extensions (nothing in v3.4 forbids them); ratification would pin them for second implementations.
+> Status: **RATIFIED as SPEC v3.5** (2026-08-28). All 25 items are applied in [SPEC.md](../SPEC.md) and stamped in [CHANGELOG.md](../CHANGELOG.md). This file is retained as the amendment rationale record — the per-item "Status: implemented" markers below keep the implementation SHA and the as-built notes, which are what the SPEC text was written from. Originally surfaced 2026-08-26–28 while preparing and running the ADHDev integration (Phases 0–4).
+>
+> **Ratification recorded the implementation, not the proposal.** Where a status marker says the implementation diverged from what the item asked for, the SPEC follows the implementation. Two proposed amendments were therefore **NOT ratified as proposed**, because the shipped code does not satisfy them:
+>
+> - **P6** — the proposed distinct `ERR_PROTOCOL` code. The over-credit *remedy* is now normative (§5.2), but the ERR still carries `ERR_ENTRY_ENCODING`. Adding a code would change frames a v3.5 peer parses, so it is deferred to v3.6. Recorded explicitly in §5.2 and in the §14 `ErrCode` block so a second implementation matches the first.
+> - **P8** — the proposed exclusion of `__proto__` from the §1 charters. The *wire-level* rejection is now normative (§5.4), but `TOPIC_RE`/`WRITER_RE` are unchanged and still admit the name at the author and import layers. Recorded explicitly in §1. (Leaving the charters alone is also why v3.5 changes no hash: `docs/test-vectors.md` remains valid.)
+>
+> Three further items were ratified with corrected wording rather than the item's own text: **P1**'s guard extends to runtime grant replacement, not `attach` alone; **P3**'s MUST admits platform-level exclusivity (an OPFS sync handle, a Durable Object isolate) alongside an OS file lock, since two of the three shipped adapters rely on it; and **P21**'s writer-form description was superseded by **P25** (the writer form merges the ring tail, and `ScanResult` carries a `complete` field the P21 status never mentioned).
 
 ## P1 — attach MUST reject a "full" grant on a subscribe-only topic (§14)
 
@@ -262,6 +269,8 @@ Proposal:
 
 > P25 was surfaced 2026-08-28 by ADHDev Phase 4 Stage 3 while wiring a parity read path over a ring-retention topic.
 
+**Status: implemented 2026-08-27** — (1) `stats().topics[t].sync` carries the interval counters, reset on every `stats()` read exactly as proposed (the interval is [previous `stats()` call, this one]; `applyRejects` stays cumulative per P22): `servedEntries`/`servedBytes`, `appliedEntries`/`appliedBytes` (applied/duplicate/pending outcomes, sibling to the P22 reject counting), and `wantRoundsRequested`/`wantRoundsServed` — keyed per topic, where the P22 `rejects` map already lives. One correction to the "Concretely" paragraph above: `serveWant` is not the only serving site — knowledge-based push (`pumpDirty`, the §6.3 catch-up gossip path that carries the bulk when the *peer* is behind) sends the same ENTRIES data frames, so it counts into served too; the receive side was already whole (`onEntries` applies both). Round counters count logical WANTs: requester side at issuance (control-lane retries of one request not re-counted), responder side per WANT frame answered (a retry re-serves, so it re-counts). Byte measure is `utf8ByteLength(JSON.stringify(entry))` on both ends. (2) `stats().syncHotspots` — top-5 `(topic, peerId, bytes)` by served+applied bytes this interval; bounded, identifiers already public in stats(), no entry content. (3) `sync_hot` informational anomaly: served+applied bytes reaching `SYNC_HOT_BYTES` (default 32 MiB) within one `SYNC_HOT_WINDOW_MS` (default 60 s) window emits at most one anomaly per window — new §16 constants, observation only, no throttle (a fixed clock window rather than the stats() interval, since a rate over a host-chosen read cadence is ill-defined and a never-polling host would accumulate forever). Regression: sync-stall.test.ts P24 block (both-end counters over a 250-entry backlog, read-resets-interval, fresh-interval re-accumulation, single sync_hot per window with sync completing unthrottled, silence at the default threshold).
+
 ## P25 — writer-form `scanEntries` cannot see the ring-retention memory tail (§9, §14)
 
 P21's writer-form `scanEntries` builds its result set from exactly two sources: `store.archivedEntries(topic, writer, fromSeq, windowEnd)` and `store.entriesRange(topic, writer, fromSeq, windowEnd)` (`src/node.ts:362-364`), both of which read durable rows (`sq_archive` and `sq_log` respectively). For a `retention.mode === "ring"` topic, `persist()` never writes either of those durable stores — it pushes the entry onto an in-memory `rings` Map and returns `null`, "no durable log row" by design (`src/log.ts:877-891`, comment at line 891). The only reader of that Map is `ringTail(topic)` (`src/log.ts:351-353`), which `scanEntries` never calls. The writer-form head lookup at `src/node.ts:354` (`core.getStream(topic, o.writer)`) does advance `contigSeq` past ring-tail appends — so the scan's own `head.contigSeq` default for `toSeq` and its `truncatedBelow` computation (`src/node.ts:369`) both see the entry as locally present, while the entry list itself comes back empty for that seq. A ring topic's most recent entries — the only entries a bounded ring retains — are therefore exactly the ones a writer-form scan cannot return.
@@ -282,4 +291,36 @@ Two corrections to the text above, from reading the source rather than the propo
 
 Regression: consumer-lifecycle.test.ts P25 block — (i) the ADHDev probe verbatim (append one entry to a `size: 3` ring, scan `fromSeq/toSeq = 1`), red before the change and green after; (ii) `truncatedBelow` accuracy across a ring that has evicted (5 appends into size 3: full tail `[3,4,5]` truncated, a window inside the tail not truncated, a window fully below it empty-and-truncated, and `limit` paging still bounded by seq window); (iii) a full-retention topic's writer scan unchanged in the same node, guarding against ring tails leaking across topics.
 
-**Status: implemented 2026-08-27** — (1) `stats().topics[t].sync` carries the interval counters, reset on every `stats()` read exactly as proposed (the interval is [previous `stats()` call, this one]; `applyRejects` stays cumulative per P22): `servedEntries`/`servedBytes`, `appliedEntries`/`appliedBytes` (applied/duplicate/pending outcomes, sibling to the P22 reject counting), and `wantRoundsRequested`/`wantRoundsServed` — keyed per topic, where the P22 `rejects` map already lives. One correction to the "Concretely" paragraph above: `serveWant` is not the only serving site — knowledge-based push (`pumpDirty`, the §6.3 catch-up gossip path that carries the bulk when the *peer* is behind) sends the same ENTRIES data frames, so it counts into served too; the receive side was already whole (`onEntries` applies both). Round counters count logical WANTs: requester side at issuance (control-lane retries of one request not re-counted), responder side per WANT frame answered (a retry re-serves, so it re-counts). Byte measure is `utf8ByteLength(JSON.stringify(entry))` on both ends. (2) `stats().syncHotspots` — top-5 `(topic, peerId, bytes)` by served+applied bytes this interval; bounded, identifiers already public in stats(), no entry content. (3) `sync_hot` informational anomaly: served+applied bytes reaching `SYNC_HOT_BYTES` (default 32 MiB) within one `SYNC_HOT_WINDOW_MS` (default 60 s) window emits at most one anomaly per window — new §16 constants, observation only, no throttle (a fixed clock window rather than the stats() interval, since a rate over a host-chosen read cadence is ill-defined and a never-polling host would accumulate forever). Regression: sync-stall.test.ts P24 block (both-end counters over a 250-entry backlog, read-resets-interval, fresh-interval re-accumulation, single sync_hot per window with sync completing unthrottled, silence at the default threshold).
+---
+
+## Ratification map (2026-08-28)
+
+Where each item landed in [SPEC.md](../SPEC.md) v3.5. "As-built delta" records where the ratified text follows the implementation rather than the proposal above it.
+
+| # | SPEC section(s) | As-built delta recorded in the SPEC |
+|---|---|---|
+| P1 | §14 `attach` | Guard covers runtime grant replacement (P15 `updateGrants`), not `attach` alone |
+| P2 | §14.1 `NodeStats` | Shape is the current superset — carries P22 `applyRejects`, P24 `sync`/`syncHotspots` |
+| P3 | §8.1 | MUST admits platform-level exclusivity (OPFS sync handle, DO isolate), not only an OS file lock |
+| P4 | §14 `Channel` | — |
+| P5 | §8.1, §14 `SqliteHandle` | — |
+| P6 | §5.2, §14 `ErrCode` | **Remedy ratified, `ERR_PROTOCOL` NOT** — ERR still rides `ERR_ENTRY_ENCODING` |
+| P7 | §5.4, §16 | — |
+| P8 | §1, §5.4 | **Wire rejection ratified, charter exclusion NOT** — `TOPIC_RE`/`WRITER_RE` unchanged |
+| P9 | §5.4 SUB | — |
+| P10 | §5.3, §14.1 | Separate `hello_timeout` event became `closed` + `reason` (see P16) |
+| P11 | §14 error carriage | Surviving sync throws enumerated: raw register append, `register()` on a non-register topic, `takeover()` without `issueTakeover` |
+| P12 | §14.1 `sanitizeJson` | Signature is `(v: unknown, path?: string)` — a `JsonValue` parameter would reject the very input it exists to accept; undefined array elements throw, no named coercion mode |
+| P13 | §14.1 `estimateEntryBytes` | `canAppend` not added — estimator + `resolveConstants()` covers it |
+| P14 | §14.1 runtime activation | Resolved via P15 + documented choreography; no separate API |
+| P15 | §5.4 HELLO, §14.1 | — |
+| P16 | §5.3, §14.1 `PeerHandleExt` | One terminal `closed` event carrying the cause; `onStateChange` unchanged and still non-replaying |
+| P17 | §9.1, §14.1 | Default `from` is the literal `"earliest-retained"`; `Order`-valued `from` not taken (that is P21's scan) |
+| P18 | §9.1, §14.1 | — |
+| P19 | §9.1, §14.1 | `onCaughtUp(cb)` not added — the promise composes; rowid stays the token |
+| P20 | §8.1 | Documented boundary only; auxiliary-writer client and read-only open deferred, not rejected |
+| P21 | §9.2, §14.1 | `ScanResult.complete` is normative (the P21 status omitted it); page bounds are fixed by §14.1, **not** `Constants` members |
+| P22 | §6.2b, §14.1 | No new §16 constant; stalled marks are sticky until a progressing round |
+| P23 | §14 `SqliteHandle` | Ratified as a permissive MAY (performance allowance), not a MUST |
+| P24 | §14.1, §16 | `sync_hot` uses a fixed clock window, deliberately not the `stats()` interval |
+| P25 | §9.2, §14.1 | `truncatedBelow` needed no change — ratified with the reason, so a second implementation does not "fix" it |

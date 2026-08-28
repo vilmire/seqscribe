@@ -1,5 +1,7 @@
-// Public type surface — mirrors SPEC v3.4 normative ts blocks (§1, §2, §7.2, §7.7,
-// §9, §11.6, §13, §14). CI cross-checks against types.d.ts generated from the SPEC.
+// Public type surface — mirrors SPEC v3.5 normative ts blocks (§1, §2, §7.2, §7.7,
+// §9, §11.6, §13, §14, §14.1). CI cross-checks against types.d.ts generated from the
+// SPEC. The v3.5 host surface (§14.1) is declared where it is implemented — session.ts,
+// consume.ts, node.ts, sync.ts, codec.ts, host.ts — and re-exported from index.ts.
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [k: string]: JsonValue };

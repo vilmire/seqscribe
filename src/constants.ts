@@ -11,7 +11,7 @@ export const DEFAULT_CONSTANTS: Constants = {
   // bound a hostile peer streams arbitrarily many distinct in-range chunks into
   // one map. 64 MiB = 256 × MAX_FRAME_BYTES; the largest library-bounded
   // legitimate body is a ring-tail SNAP of RING_DEFAULT (500) rows ×
-  // MAX_ROW_BYTES (65_536) ≈ 32 MiB, ≈ 43.7 MiB after base64 — comfortably
+  // MAX_ROW_BYTES (65_536) = 31.25 MiB, ≈ 41.7 MiB after base64 — comfortably
   // under. Hosts serving bigger (policy-unbounded) view tables raise this.
   MAX_REASSEMBLY_BYTES: 67_108_864,
   INFLIGHT_CREDITS: 4,
