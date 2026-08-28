@@ -44,20 +44,35 @@ export class BeaconHub {
   private known: BeaconReport[] = [];
   private transport: BeaconTransport | null = null;
   private debounceTimer: unknown = null;
-  private stopped = false;
+  // Node-level teardown (proposals-v3.5 P28). Terminal and distinct from an
+  // arming's stop(): a BeaconHub that outlived its owning node's close() must
+  // never push again, so this is the one latch that is genuinely one-way.
+  private closed = false;
   private hostHints: (() => HintMap) | null = null;
+  // Monotonic arming id. stop() is a PAUSE — the hub is re-startable, matching
+  // the shape of start() itself (a handle you can stop() reads as something you
+  // can start() again) and the reconnect-scoped re-arm hosts actually write.
+  // Handles are per-arming: a stale handle's stop() must not tear down a LATER
+  // arming, which is why stop() compares its own generation before acting.
+  private armGen = 0;
 
   constructor(private readonly deps: BeaconHubDeps) {}
 
   start(t: BeaconTransport, o?: BeaconStartOpts): BeaconHandle {
+    if (this.closed) throw misuse("beacon closed — the node is closed");
     if (this.transport) throw misuse("beacon already started");
+    const gen = ++this.armGen;
     this.transport = t;
     this.hostHints = o?.hints ?? null;
     this.push(); // initial report; GET piggybacks on each push
     return {
       stop: () => {
-        this.stopped = true;
-        if (this.debounceTimer !== null) this.deps.timers.clearTimeout(this.debounceTimer);
+        if (this.armGen !== gen) return; // stale handle — a later arming owns the hub
+        this.armGen++; // retire this arming: its in-flight rounds stop counting
+        if (this.debounceTimer !== null) {
+          this.deps.timers.clearTimeout(this.debounceTimer);
+          this.debounceTimer = null;
+        }
         this.transport = null;
         this.hostHints = null;
       },
@@ -68,17 +83,19 @@ export class BeaconHub {
   // core.vectors() when it fires, so node.close() must cancel it like every
   // other hub timer rather than rely on the host calling the handle's stop().
   close(): void {
-    this.stopped = true;
+    this.closed = true;
+    this.armGen++; // invalidate every outstanding handle
     if (this.debounceTimer !== null) {
       this.deps.timers.clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
     }
     this.transport = null;
+    this.hostHints = null;
   }
 
   // called from the applied fan-out — 5 s debounce after append (§5.7)
   notifyApplied(): void {
-    if (!this.transport || this.stopped || this.debounceTimer !== null) return;
+    if (!this.transport || this.closed || this.debounceTimer !== null) return;
     this.debounceTimer = this.deps.timers.setTimeout(() => {
       this.debounceTimer = null;
       this.push();
@@ -179,7 +196,8 @@ export class BeaconHub {
 
   private push(): void {
     const t = this.transport;
-    if (!t || this.stopped) return;
+    if (!t || this.closed) return;
+    const gen = this.armGen;
     const report: BeaconReport = {
       node: this.deps.writerId,
       at: new Date(this.deps.clock()).toISOString(),
@@ -191,7 +209,10 @@ export class BeaconHub {
       .put(report)
       .then(() => t.get())
       .then((reports) => {
-        if (!this.stopped) this.known = reports;
+        // Adopt only if this hub is still on the arming that issued the round:
+        // a GET answered after a stop (or after a re-arm onto a different
+        // transport) describes a board this hub is no longer reporting to.
+        if (!this.closed && this.armGen === gen) this.known = reports;
       })
       .catch(() => {
         // beacon is best-effort — sync is unaffected without it (§5.7)

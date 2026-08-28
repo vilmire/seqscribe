@@ -33,12 +33,19 @@ function makeNode(sched: Scheduler, writerId: string): SeqscribeNode {
   return node;
 }
 
-function memoryBeacon(): { transport: BeaconTransport; board: Map<string, BeaconReport> } {
+function memoryBeacon(): {
+  transport: BeaconTransport;
+  board: Map<string, BeaconReport>;
+  puts: () => number;
+} {
   const board = new Map<string, BeaconReport>();
+  let puts = 0;
   return {
     board,
+    puts: () => puts,
     transport: {
       put: async (r) => {
+        puts++;
         board.set(r.node, r); // one report per node, overwrite (§14)
       },
       get: async () => [...board.values()],
@@ -80,6 +87,120 @@ describe("beacon (§5.7)", () => {
     expect(() => a.beacon(transport)).toThrowError(/beacon already started/);
     h.stop();
     await sched.run();
+  });
+});
+
+// proposals-v3.5 P28 — `stopped` was a one-way latch: start() never cleared it,
+// so a stop-then-restart handle looked healthy and pushed exactly zero times.
+describe("beacon re-arm after stop (P28)", () => {
+  it("re-arms: stop() then start() pushes again", async () => {
+    const sched = new Scheduler(0);
+    const { transport, puts } = memoryBeacon();
+    const a = makeNode(sched, "wA");
+
+    const h1 = a.beacon(transport);
+    await sched.run({ untilMs: 100 });
+    expect(puts()).toBe(1); // the initial report
+
+    void a.log(T).append("note", { i: 0 });
+    await sched.run({ untilMs: 10_000 }); // past BEACON_DEBOUNCE_MS
+    const armed = puts();
+    expect(armed).toBeGreaterThan(1); // the debounced push landed
+
+    // the ADHDev reconnect pattern: detach → re-attach on the same hub
+    h1.stop();
+    await sched.run({ untilMs: 11_000 });
+    const afterStop = puts();
+
+    const h2 = a.beacon(transport); // must not throw — stop() is a pause
+    await sched.run({ untilMs: 12_000 });
+    expect(puts()).toBe(afterStop + 1); // start()'s own initial report
+
+    // and the debounce is live again, which is the part the latch killed
+    void a.log(T).append("note", { i: 1 });
+    await sched.run({ untilMs: 30_000 });
+    expect(puts()).toBeGreaterThan(afterStop + 1);
+
+    h2.stop();
+    await a.close();
+  });
+
+  it("close() stays terminal — a closed node's beacon cannot be re-armed", async () => {
+    // the case that separates the real fix from "just clear stopped in start()":
+    // node-level teardown must stay irreversible
+    const sched = new Scheduler(0);
+    const { transport, puts } = memoryBeacon();
+    const a = makeNode(sched, "wA");
+    a.beacon(transport);
+    await sched.run({ untilMs: 100 });
+    const before = puts();
+
+    await a.close();
+    // matched narrowly on purpose: a bare /closed/ would also be satisfied by
+    // a generic node-level "node is closed" guard, so a regression that made
+    // BeaconHub itself re-armable after close() could still pass
+    expect(() => a.beacon(transport)).toThrowError(/beacon closed/);
+    await sched.run({ untilMs: 20_000 });
+    expect(puts()).toBe(before); // nothing pushed after close, ever
+  });
+
+  it("still refuses a double start without an intervening stop", async () => {
+    const sched = new Scheduler(0);
+    const { transport } = memoryBeacon();
+    const a = makeNode(sched, "wA");
+    const h = a.beacon(transport);
+    expect(() => a.beacon(transport)).toThrowError(/beacon already started/);
+    h.stop();
+    await a.close();
+  });
+
+  it("a round answered after stop() does not overwrite known vectors", async () => {
+    // the GET tail is async: a response landing after the host detached
+    // describes a board this hub is no longer reporting to
+    const sched = new Scheduler(0);
+    const a = makeNode(sched, "wA");
+    const stale: BeaconReport = {
+      node: "wGhost",
+      at: "2026-08-28T00:00:00Z",
+      vectors: { [T]: { writers: { wGhost: { contig: 99, chain: "x" } } } },
+    };
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const h = a.beacon({
+      put: async () => {},
+      get: async () => {
+        await gate;
+        return [stale];
+      },
+    });
+    await sched.run({ untilMs: 100 });
+    h.stop(); // detach while the GET is still in flight
+    release();
+    await new Promise((r) => setTimeout(r, 0));
+    await sched.run({ untilMs: 200 });
+    // the late round must not have been adopted
+    expect(a.staleness(T).behind.wGhost ?? 0).toBe(0);
+    await a.close();
+  });
+
+  it("a stale handle's stop() does not disarm the current arming", async () => {
+    // h1.stop() after a re-arm must not tear down h2's session — the handles
+    // are per-arming, and a host holding an old one is the natural mistake
+    const sched = new Scheduler(0);
+    const { transport, puts } = memoryBeacon();
+    const a = makeNode(sched, "wA");
+    const h1 = a.beacon(transport);
+    await sched.run({ untilMs: 100 });
+    h1.stop();
+    a.beacon(transport); // re-arm
+    await sched.run({ untilMs: 200 });
+    const armed = puts();
+
+    h1.stop(); // stale handle — must be a no-op
+    void a.log(T).append("note", { i: 0 });
+    await sched.run({ untilMs: 20_000 });
+    expect(puts()).toBeGreaterThan(armed); // still pushing
+    await a.close();
   });
 });
 
