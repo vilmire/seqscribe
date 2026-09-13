@@ -328,7 +328,8 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
 
     vectors: () => core.vectors(),
 
-    setKnownVectors: (v: BeaconReport[]) => beaconHub.setKnownVectors(v),
+    setKnownVectors: (v: BeaconReport[], o?: { truncated?: number }) =>
+      beaconHub.setKnownVectors(v, o),
     staleness: (topic, key) => beaconHub.staleness(topic, key),
     beacon: (t: BeaconTransport, o?: BeaconStartOpts) => beaconHub.start(t, o),
 

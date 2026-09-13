@@ -481,3 +481,93 @@ describe("host-initiated push (P30)", () => {
     expect(puts()).toBe(afterClose);
   });
 });
+
+// proposals-v3.8 P34 — staleness() was computed and discarded: the two questions
+// §5.7 says a beacon makes answerable (wake-up lag, sole-copy awareness) had no
+// reader, so every host re-derived them — including the truncation rule, which the
+// natural implementation gets wrong by returning a confident `false`.
+describe("staleness derivations (P34)", () => {
+  it("aheadPeers names writers a peer holds more of — no board completeness needed", async () => {
+    const sched = new Scheduler(0);
+    const a = makeNode(sched, "wA");
+    void a.log(T).append("note", { i: 0 });
+    await sched.run({ untilMs: 1_000 });
+
+    // a peer reports being 7 ahead on its own stream, and behind on ours
+    a.setKnownVectors([
+      {
+        node: "wB",
+        at: new Date(0).toISOString(),
+        vectors: { [T]: { writers: { wB: { contig: 7, chain: "x" }, wA: { contig: 0, chain: "y" } } } },
+      },
+    ]);
+
+    const s = a.staleness(T);
+    expect(s.behind.wB).toBe(7);
+    expect(s.aheadPeers).toEqual(["wB"]);
+    // deliberately still unknown: aheadPeers needs no completeness, sole-copy does
+    expect(s.soleCopyRisk).toBe("unknown");
+    await a.close();
+  });
+
+  it("soleCopyRisk is 'unknown' until the board is known WHOLE", async () => {
+    const sched = new Scheduler(0);
+    const a = makeNode(sched, "wA");
+    void a.log(T).append("note", { i: 0 });
+    await sched.run({ untilMs: 1_000 });
+
+    // no board observed at all
+    expect(a.staleness(T).soleCopyRisk).toBe("unknown");
+
+    // a board whose completeness the host did not state
+    const board = [
+      { node: "wB", at: new Date(0).toISOString(), vectors: { [T]: { writers: {} } } },
+    ];
+    a.setKnownVectors(board);
+    expect(a.staleness(T).soleCopyRisk).toBe("unknown");
+
+    // a board the host says was TRUNCATED — the peer holding our entry may be
+    // one the server dropped, so `false` would be a confident wrong answer
+    a.setKnownVectors(board, { truncated: 2 });
+    expect(a.staleness(T).soleCopyRisk).toBe("unknown");
+
+    // only a whole board can answer — and here nobody holds our entry
+    a.setKnownVectors(board, { truncated: 0 });
+    expect(a.staleness(T).soleCopyRisk).toBe(true);
+    await a.close();
+  });
+
+  it("soleCopyRisk is false once a peer on a whole board covers our streams", async () => {
+    const sched = new Scheduler(0);
+    const a = makeNode(sched, "wA");
+    for (let i = 0; i < 3; i++) void a.log(T).append("note", { i });
+    await sched.run({ untilMs: 1_000 });
+
+    // a peer that has caught up to our contig covers the stream
+    a.setKnownVectors(
+      [
+        {
+          node: "wB",
+          at: new Date(0).toISOString(),
+          vectors: { [T]: { writers: { wA: { contig: 3, chain: "z" } } } },
+        },
+      ],
+      { truncated: 0 },
+    );
+    expect(a.staleness(T).soleCopyRisk).toBe(false);
+
+    // a peer that is BEHIND does not cover it — one entry exists only here
+    a.setKnownVectors(
+      [
+        {
+          node: "wB",
+          at: new Date(0).toISOString(),
+          vectors: { [T]: { writers: { wA: { contig: 2, chain: "z" } } } },
+        },
+      ],
+      { truncated: 0 },
+    );
+    expect(a.staleness(T).soleCopyRisk).toBe(true);
+    await a.close();
+  });
+});

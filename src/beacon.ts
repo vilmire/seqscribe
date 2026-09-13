@@ -42,6 +42,11 @@ export interface BeaconHubDeps {
 
 export class BeaconHub {
   private known: BeaconReport[] = [];
+  // P34 board-completeness state. `boardSeen` distinguishes "no board yet" from
+  // "an empty board", which are different answers: the first cannot judge
+  // anything, the second legitimately has no peers to compare against.
+  private boardSeen = false;
+  private boardTruncated: number | undefined = undefined;
   private transport: BeaconTransport | null = null;
   private debounceTimer: unknown = null;
   // Node-level teardown (proposals-v3.5 P28). Terminal and distinct from an
@@ -109,8 +114,16 @@ export class BeaconHub {
     }, this.deps.constants.BEACON_DEBOUNCE_MS);
   }
 
-  setKnownVectors(v: BeaconReport[]): void {
+  // proposals-v3.8 P34: `o.truncated` is the host's count of peer reports the
+  // board did NOT return. The library cannot derive it — BeaconTransport.get()
+  // yields BeaconReport[] with no completeness signal — so sole-copy judgement
+  // depends on the host passing it. Omitting it is treated as "unknown
+  // completeness", which is the fail-safe reading: a board that might be a
+  // subset can never prove a sole copy.
+  setKnownVectors(v: BeaconReport[], o?: { truncated?: number }): void {
     this.known = v;
+    this.boardSeen = true;
+    this.boardTruncated = o?.truncated;
   }
 
   // wake-up lag & pre-write warning source (§5.7): how far each known peer's
@@ -134,7 +147,31 @@ export class BeaconHub {
           latestKnown = [topic, hint[0], hint[1]];
       }
     }
-    const out: Staleness = { behind, asOf: new Date(this.deps.clock()).toISOString() };
+    // P34: the two questions the beacon exists to answer, derived here rather
+    // than left to every host. `aheadPeers` needs no completeness: seeing ONE
+    // peer ahead proves lag, and a truncated board can only UNDER-report it.
+    const aheadPeers = Object.entries(behind)
+      .filter(([, lag]) => lag > 0)
+      .map(([w]) => w)
+      .sort();
+    // soleCopyRisk is the opposite: it is a claim about EVERY peer, so it is
+    // unprovable unless the board is known whole. "unknown" is the only honest
+    // answer when completeness is unknown — `false` would be a confident wrong
+    // answer (the peer holding the entry may be one the board dropped) and
+    // `true` would invent a data-loss scare. It is a three-valued union rather
+    // than a nullable boolean so a caller cannot squint at it and get a falsy
+    // read (which is what makes the dangerous direction the easy one).
+    const soleCopyRisk: Staleness["soleCopyRisk"] = !this.boardSeen
+      ? "unknown" // no board observed yet — nothing to compare against
+      : this.boardTruncated === undefined || this.boardTruncated > 0
+        ? "unknown" // completeness unknown, or known-incomplete
+        : this.localOnlyAgainstBoard(topic);
+    const out: Staleness = {
+      behind,
+      aheadPeers,
+      soleCopyRisk,
+      asOf: new Date(this.deps.clock()).toISOString(),
+    };
     if (key !== undefined && latestKnown) {
       const [t, w, s] = latestKnown;
       out.keyStale = {
@@ -143,6 +180,31 @@ export class BeaconHub {
       };
     }
     return out;
+  }
+
+  // P34: true when this node holds entries on `topic` that NO peer on a
+  // known-whole board reports holding. Per-writer and conservative: a peer whose
+  // contig reaches our own is enough to clear the stream, and a retired writer's
+  // finalSeq counts as coverage. Only ever called once completeness is known.
+  private localOnlyAgainstBoard(topic: Topic): boolean {
+    const mine = this.deps.core.vectors()[topic];
+    if (!mine) return false; // nothing held locally — nothing can be sole-copy
+    for (const [writer, w] of Object.entries(mine.writers)) {
+      const myContig = "retired" in w ? w.finalSeq : w.contig;
+      if (myContig <= 0) continue;
+      let covered = false;
+      for (const report of this.known) {
+        const theirs = report.vectors[topic]?.writers?.[writer];
+        if (!theirs) continue;
+        const theirSeq = "retired" in theirs ? theirs.finalSeq : theirs.contig;
+        if (theirSeq >= myContig) {
+          covered = true;
+          break;
+        }
+      }
+      if (!covered) return true; // at least one stream exists only here
+    }
+    return false;
   }
 
   // §5.7 hints (P27). `hintKeys` is the per-topic opt-in gate: a topic that has
@@ -227,7 +289,14 @@ export class BeaconHub {
         // Adopt only if this hub is still on the arming that issued the round:
         // a GET answered after a stop (or after a re-arm onto a different
         // transport) describes a board this hub is no longer reporting to.
-        if (!this.closed && this.armGen === gen) this.known = reports;
+        if (!this.closed && this.armGen === gen) {
+          this.known = reports;
+          // The library's own GET has no completeness signal either (P34), so a
+          // board adopted here leaves `truncated` unknown rather than asserting
+          // it was whole. A host that knows better calls setKnownVectors().
+          this.boardSeen = true;
+          this.boardTruncated = undefined;
+        }
       })
       .catch(() => {
         // beacon is best-effort — sync is unaffected without it (§5.7)

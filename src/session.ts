@@ -24,7 +24,11 @@ import type {
 } from "./types.js";
 
 export const PROTO_MIN = 1;
-export const PROTO_MAX = 1;
+// proto 2 (proposals-v3.8 P38): adds the distinct `ERR_PROTOCOL` code on the four
+// protocol-violation closes. Accepting 1 is what keeps mixed-version fleets whole —
+// a proto-1 peer's ErrCode union has no ERR_PROTOCOL, so against such a peer those
+// sites keep emitting ERR_ENTRY_ENCODING exactly as v3.5–v3.7 specified.
+export const PROTO_MAX = 2;
 
 export type SessionState = "attached" | "ready" | "closed";
 
@@ -83,6 +87,9 @@ interface PendingRequest {
 
 export class Session {
   readonly peerId: string;
+  // negotiated protocol version; 1 until HELLO completes (P38)
+  private protoNow = 1;
+
   readonly peerClass: "content" | "metadata";
   private grants: Record<Topic, "full" | "serve" | "none">;
 
@@ -327,6 +334,14 @@ export class Session {
 
   // ---- lifecycle ----
 
+  // P38: the ERR code for a protocol violation, chosen by negotiated version.
+  // proto ≥ 2 peers get the distinct `ERR_PROTOCOL`; proto-1 peers keep
+  // `ERR_ENTRY_ENCODING`, whose union they actually have. Every protocol-violation
+  // close site routes through here so the four of them cannot drift apart.
+  violationCode(): "ERR_PROTOCOL" | "ERR_ENTRY_ENCODING" {
+    return this.protoNow >= 2 ? "ERR_PROTOCOL" : "ERR_ENTRY_ENCODING";
+  }
+
   close(reason: SessionCloseReason = "detach"): void {
     if (this.stateNow === "closed") return;
     this.stateNow = "closed";
@@ -437,6 +452,11 @@ export class Session {
       this.close("protocol");
       return;
     }
+    // P38: the negotiated version was previously computed and discarded. It is
+    // retained because the ERR code on a protocol-violation close now depends on
+    // it — this is the "negotiated way for peers to know the code is available"
+    // that the v3.5/v3.6/v3.7 deferrals were waiting for.
+    this.protoNow = proto;
     this.peerGrants = m.grants;
     this.peerGrantsGen = m.grantsGen ?? 0;
     this.recomputeRefusals();
@@ -494,7 +514,7 @@ export class Session {
     if (m.mid > this.recvContigMid + this.c.INFLIGHT_CREDITS) {
       this.sendControl({
         t: "ERR",
-        code: "ERR_ENTRY_ENCODING",
+        code: this.violationCode(), // P38
         detail: `data mid ${m.mid} beyond credit window`,
       });
       this.close("protocol");

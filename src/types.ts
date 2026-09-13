@@ -129,6 +129,12 @@ export interface Constants {
 
 export type ErrCode =
   | "ERR_PROTO_VERSION"
+  // Protocol violation on a frame the receiver is being closed on (proposals-v3.8
+  // P38, proto ≥ 2): credit-window abuse (§5.2) and the three §5.4 chunked
+  // reassembly overflows. Only sent to a peer that negotiated proto ≥ 2 — a
+  // proto-1 peer receives ERR_ENTRY_ENCODING at those sites, which is what its own
+  // union contains, so mixed-version fleets are unaffected.
+  | "ERR_PROTOCOL"
   | "ERR_SCHEMA_MISMATCH"
   | "ERR_ACL_DENIED"
   | "ERR_UNKNOWN_TOPIC"
@@ -294,7 +300,26 @@ export interface OwnedRequest {
 
 export interface Staleness {
   behind: Record<WriterId, number>;
+  // proposals-v3.8 P34: the two questions §5.7 says a beacon makes answerable,
+  // derived by the library so every host does not re-derive them (and get the
+  // truncation rule below subtly wrong).
+  //
+  // `aheadPeers` — writers some known peer holds more of than we do (wake-up
+  // lag). Needs no board completeness: seeing one peer ahead proves lag, and a
+  // truncated board can only under-report it.
+  aheadPeers: WriterId[];
+  // `soleCopyRisk` — whether this node holds entries no known peer does. This is
+  // a claim about EVERY peer, so it is UNPROVABLE unless the board is known
+  // whole: pass `truncated` to setKnownVectors() to make it answerable. Absent
+  // or non-zero truncation, or no board observed yet, the answer is "unknown" —
+  // `false` would be a confident wrong answer (the holder may be a peer the
+  // board dropped) and `true` would invent a data-loss scare. Three-valued on
+  // purpose: a nullable boolean makes the dangerous reading the easy one.
+  soleCopyRisk: true | false | "unknown";
   asOf: string;
+  // Advisory ONLY and MUST NOT gate correctness (§5.7a): the cross-report
+  // tie-break compares raw `seq` across writers because `hints` carries no
+  // Order, so this is a known wire-shape approximation.
   keyStale?: { latestKnown: EntryId; haveLocally: boolean };
 }
 
@@ -358,7 +383,10 @@ export interface SeqscribeNode {
     },
   ): PeerHandle;
   vectors(): HaveVectors;
-  setKnownVectors(v: BeaconReport[]): void;
+  // `o.truncated` (P34): how many peer reports the board did NOT return. The
+  // library cannot derive this — BeaconTransport.get() carries no completeness
+  // signal — and without it `staleness().soleCopyRisk` stays "unknown".
+  setKnownVectors(v: BeaconReport[], o?: { truncated?: number }): void;
   staleness(topic: Topic, key?: Key): Staleness;
   beacon(t: BeaconTransport): BeaconHandle;
   finality(topic: Topic): FinalityCert | null;

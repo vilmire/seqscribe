@@ -200,7 +200,10 @@ interface Harness {
   sent: string[];
   frames: () => { t: string; code?: string }[];
   inject: (raw: string) => void; // the host's onMessage callback, verbatim
-  ready: () => void; // answer the session's HELLO so it negotiates to ready
+  // answer the session's HELLO so it negotiates to ready. `protoMax` defaults to
+  // 1 — the compatibility path — so every pre-P38 test keeps asserting the code a
+  // proto-1 peer actually receives.
+  ready: (protoMax?: number) => void;
   close: () => void;
 }
 
@@ -234,13 +237,13 @@ function makeHarness(constants: Partial<Constants> = {}): Harness {
     sent,
     frames,
     inject: (raw) => onMsg!(raw),
-    ready: () => {
+    ready: (protoMax = 1) => {
       // echo our own HELLO's grants back (identical schemaHash) as the peer
       const hello = frames().find((f) => f.t === "HELLO") as unknown as {
         grants: Record<string, { mode: string; schemaHash: string }>;
       };
       onMsg!(
-        JSON.stringify({ t: "HELLO", protoMin: 1, protoMax: 1, node: "wPeer", grants: hello.grants }),
+        JSON.stringify({ t: "HELLO", protoMin: 1, protoMax, node: "wPeer", grants: hello.grants }),
       );
     },
     close: () => void node.close(),
@@ -518,6 +521,48 @@ describe("chunked reassembly total bound (MAX_REASSEMBLY_BYTES)", () => {
     // no residual memory, and the (content-derived) snapshotId is re-requestable
     expect(internals(h).snapshotHub.assemblies.size).toBe(0);
     expect(internals(h).snapshotHub.requested.has(HEX64)).toBe(false);
+    h.close();
+  });
+});
+
+// proposals-v3.8 P38 — the distinct ERR_PROTOCOL code, deferred through v3.5/v3.6/
+// v3.7 because it needed "a negotiated way for peers to know the code is
+// available". HELLO's protoMin/protoMax already was that way; proto 2 uses it.
+describe("ERR_PROTOCOL is version-gated (P38)", () => {
+  // same shape as the §5.2 credit-window block above, scoped here
+  const entriesFrame = (mid: number) =>
+    `{"t":"ENTRIES","mid":${mid},"topic":"${T}","writer":"wPeer","fromSeq":1,"toSeq":0,"entries":[],"done":true}`;
+
+  it("sends ERR_PROTOCOL to a proto-2 peer on a credit-window violation", () => {
+    const h = makeHarness();
+    h.ready(2); // peer advertises proto 2 → negotiated 2
+    const before = h.sent.length;
+    h.inject(entriesFrame(5)); // contig 0 + credits 4 < 5
+    expect(errsAfter(h, before)[0]!.code).toBe("ERR_PROTOCOL");
+    expect(h.handle.state()).toBe("closed");
+    h.close();
+  });
+
+  it("keeps ERR_ENTRY_ENCODING for a proto-1 peer — the compatibility claim", () => {
+    // a proto-1 peer's ErrCode union has no ERR_PROTOCOL, so emitting it would
+    // hand a mixed-version fleet a frame its peers cannot parse. This is the
+    // assertion that makes the whole change safe to ship.
+    const h = makeHarness();
+    h.ready(1);
+    const before = h.sent.length;
+    h.inject(entriesFrame(5));
+    expect(errsAfter(h, before)[0]!.code).toBe("ERR_ENTRY_ENCODING");
+    h.close();
+  });
+
+  it("a peer that never completes HELLO is treated as proto 1", () => {
+    // protoNow stays 1 until negotiation lands, so a violation before HELLO
+    // cannot emit a code the peer may not understand
+    const h = makeHarness();
+    const before = h.sent.length;
+    h.inject(entriesFrame(5)); // no ready() — still "attached"
+    const errs = errsAfter(h, before);
+    if (errs.length > 0) expect(errs[0]!.code).not.toBe("ERR_PROTOCOL");
     h.close();
   });
 });

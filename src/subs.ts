@@ -481,7 +481,7 @@ export class SubHub {
       sub.chunkBytes = 0;
       session.sendControl({
         t: "ERR",
-        code: "ERR_ENTRY_ENCODING",
+        code: session.violationCode(), // P38
         detail: `SNAP reassembly exceeds MAX_REASSEMBLY_BYTES (subId ${m.subId})`,
       });
       session.close("protocol");

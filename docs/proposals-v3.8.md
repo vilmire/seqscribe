@@ -1,6 +1,6 @@
 # SPEC amendments — P30–P36 (P30–P33, P35–P36 ratified as v3.7; P34 open)
 
-> Status: **P30–P33 RATIFIED as SPEC v3.7** (2026-09-13) — applied in [SPEC.md](../SPEC.md) §5.7/§11.1/§14/§14.1/§14.2 and stamped in [CHANGELOG.md](../CHANGELOG.md). **P34 is NOT ratified and NOT implemented** (see its own status). This file is retained as the amendment rationale record; the per-item "Status" markers record what was actually built, including where it diverged from the proposal.
+> Status: **P30–P38 all RATIFIED as SPEC v3.7** (2026-09-13) — applied in [SPEC.md](../SPEC.md) §5.2/§5.7/§5.7a/§7.6/§11.1/§11.6/§14/§14.1/§14.2 and stamped in [CHANGELOG.md](../CHANGELOG.md). P34 was initially deferred here for want of a shape; it landed once the missing input was identified (board completeness is host-supplied because `BeaconTransport` carries no truncation signal). This file is retained as the amendment rationale record; the per-item "Status" markers record what was actually built, including where it diverged from the proposal.
 >
 > Ratification followed the v3.5/v3.6 discipline: the SPEC text was written from the **implementation**, not from the proposals above. Two places where the two disagreed, with the SPEC following the code: P31's `readIntervalStats()` copies each counter object (the proposal did not mention it — the defect was found while implementing, and the SPEC now states the MUST), and P33 landed as the in-source caller warning plus normative §11.1/§14 text, with the proposal's remedy (2) explicitly not taken.
 >
@@ -146,7 +146,7 @@ Worse, the honest answer requires knowing something only the host has: whether i
 
 This also explains why **P27's `keyStale` could ship inert for two revisions**: `staleness()` has no way to signal "this feature has no data source", because an absent `keyStale` is also the correct return when no peer is ahead. A surface that cannot distinguish *no data* from *no problem* will hide its own breakage, and did.
 
-**Status: NOT implemented** — deliberately. This is the one item here whose *shape* is uncertain rather than just its wording, and getting an aggregate wrong would bake a second host's arithmetic into the library. Deferred pending a second embedder.
+**Status: implemented 2026-09-13.** The shape resolved once the blocking question was named precisely: *can the library know whether its board is complete?* It cannot — `BeaconTransport.get()` returns `BeaconReport[]` with no truncation signal — so completeness is an **input**, not a derivation. `setKnownVectors(v, { truncated })` supplies it; `staleness()` then returns `aheadPeers` (needs no completeness: one peer ahead proves lag) and `soleCopyRisk: true | false | "unknown"` (needs it, because the claim is about *every* peer). Absent truncation, non-zero truncation, and no-board-yet all yield `"unknown"` — fail-safe by construction, so a host that never supplies completeness simply never gets a sole-copy claim instead of getting a wrong one. Three-valued rather than nullable-boolean on purpose: a nullable boolean makes the dangerous reading (falsy ⇒ "not at risk") the easy one. Regression: `test/beacon.test.ts` "staleness derivations (P34)" — `aheadPeers` without completeness, `"unknown"` across all three ignorance cases, and both `true`/`false` once the board is stated whole.
 
 **Amendment** (lowest-confidence item here — the shape deserves a second embedder before ratification):
 
@@ -184,6 +184,32 @@ This was previously tracked as a known gap with the parenthetical "a spec-level 
 
 ---
 
+---
+
+## P37 — the package split's precondition was true by accident, with nothing checking it
+
+DESIGN §8 splits this repo into `seqscribe` / `seqscribe-ws` / `seqscribe-beacon` / `@seqscribe/*`. The split itself is correctly deferred to release — moving folders while the package is unpublished would break the embedder's `file:` vendor path for no benefit. But the *property the split depends on* — that the would-be-separate modules do not reach into core internals — held only by accident of good layering, with nothing enforcing it.
+
+Inspection found the situation better and narrower than the tracked note implied: `ws.ts` (94 lines) and `adapters.ts` (211 lines) already import **types only**, so they are split-ready today. And `seqscribe-beacon` in DESIGN §8 means the reference **server**; the beacon *client* (`BeaconHub`) is core by design (DESIGN §5.7 — `node.ts` owns one) and is not moving. So the remaining risk is not "do the split" but "don't silently lose the ability to".
+
+**Amendment**: none — this is a repo-hygiene gate, not a contract change.
+
+**Status: implemented 2026-09-13** — `tools/check-boundaries.mjs`, wired into `npm run check` (and therefore CI) as `check:boundaries`. Each listed module declares the only local modules it may import; a violation fails with the DESIGN §8 rationale rather than a bare diff. `beacon.ts` is listed with its full current set *allowed* rather than restricted, so a new core dependency there is a deliberate edit to the gate instead of invisible drift. Verified in both directions: adding a `./session.js` import to `ws.ts` exits 1 with the explanation; removing it exits 0.
+
+---
+
+## P38 — `ERR_PROTOCOL` was deferred three times for a mechanism that already existed
+
+P6 (v3.5) proposed a distinct protocol-violation `ErrCode`. v3.5 declined it, v3.6 re-deferred it, and v3.7's first pass re-deferred it again — each time on the same reasoning, recorded in §5.2: the code should arrive *"alongside a protocol-version bump that gives peers a negotiated way to know the code is available"*, not as a silent widening of the union.
+
+**That mechanism was already in the wire.** `HELLO` has carried `protoMin`/`protoMax` since v3.1 and `Session` already computes `Math.min(PROTO_MAX, m.protoMax)` and rejects incompatible ranges with `ERR_PROTO_VERSION`. It had simply never been *used* for anything: both bounds were pinned at 1, and the negotiated result was computed and thrown away. Three revisions deferred an item waiting for a facility the implementation had the whole time — which is the same shape as P30 (a feature hardened across two cycles that no host could reach) and P34 (a reader the SPEC certified and nobody wrote).
+
+**Amendment**: `PROTO_MAX` 1 → 2, `ERR_PROTOCOL` added to `ErrCode`, and §5.2 states the gating rule — a receiver that negotiated **proto ≥ 2** MUST send `ERR_PROTOCOL` at the four protocol-violation closes (the §5.2 credit-window bound and the three §5.4 reassembly overflows); one that negotiated **proto 1** MUST send `ERR_ENTRY_ENCODING` there, which is what a proto-1 peer's union contains. Pre-HELLO sessions count as proto 1.
+
+**Status: implemented 2026-09-13** — the negotiated version is now retained (`Session.protoNow`) and all four sites route through one `Session.violationCode()` helper, so they cannot drift apart. The remedy is unchanged and **no peer's behavior depends on which code it receives** — it is being closed on either way, which is exactly why this is safe as a pure diagnostic refinement. Regression: `test/wire-hardening.test.ts` "ERR_PROTOCOL is version-gated (P38)" — proto-2 gets the new code, **proto-1 still gets `ERR_ENTRY_ENCODING` (the assertion that makes it shippable)**, and a session that never completed HELLO is treated as proto 1. The harness's `ready()` now takes a `protoMax` defaulting to 1, so every pre-P38 test keeps asserting what a proto-1 peer actually receives.
+
+---
+
 ## Summary
 
 | # | Gap | Host cost today | Fix size |
@@ -194,9 +220,11 @@ This was previously tracked as a known gap with the parenthetical "a spec-level 
 | **P31** | `stats()` destructive ⇒ caller count changes values | **Implemented** (remedy 1) — `stats()` pure, `drainSyncInterval()` explicit. *Behavior change to a shipped API* |
 | **P32** | `Anomaly` carries no topic/peer/view/consumer | **Implemented** — five optional fields, populated at every emit site with the identifier in scope |
 | **P33** | One synchronous throw in an otherwise-async `append` | **Implemented** (remedy 1, documentation). §14 amendment text still to write at ratification |
-| **P34** | `staleness()` has no reader for the features it feeds | **Not implemented** — shape uncertain, deferred for a second embedder |
+| **P34** | `staleness()` has no reader for the features it feeds | **Implemented** — `aheadPeers` + three-valued `soleCopyRisk`; completeness is host-supplied |
 | **P35** | §7.6 named a filesystem archive path two shipped adapters cannot write | **Implemented** (doc only) — §7.6 now specifies behavior, not storage form |
 | **P36** | `RegisterSnapshotState` omits pending requests, undocumented | **Implemented** (doc only) — the decision and its remedy are now stated |
+| **P37** | Package-split precondition true by accident, unenforced | **Implemented** — `check:boundaries` gate in CI; split itself still at release |
+| **P38** | `ERR_PROTOCOL` deferred 3× for a mechanism HELLO already had | **Implemented** — `PROTO_MAX` 2, gated so proto-1 peers are unaffected |
 
 `npm run check` green across all of it: 275 tests (up from 271), strict `types.d.ts` pass, fixture consumability gate.
 

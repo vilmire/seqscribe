@@ -427,7 +427,7 @@ export class SyncEngine {
       ps.expectedHaveReq = null;
       ps.session.sendControl({
         t: "ERR",
-        code: "ERR_ENTRY_ENCODING",
+        code: ps.session.violationCode(), // P38
         detail: `HAVE reassembly exceeds MAX_REASSEMBLY_BYTES (req ${m.req})`,
       });
       ps.session.close("protocol");
