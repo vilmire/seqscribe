@@ -229,6 +229,10 @@ export interface PeerHandle {
 export interface ViewHandle {
   name: string;
   version: string;
+  // the materialized table this view folds into — `sqv_<name>_<hash8>`. Exposed
+  // because `query()` takes raw SQL and therefore needs the table's identity to
+  // be usable from outside the library at all.
+  table: string;
   rebuild(): Promise<void>;
   query<T = Row>(sql: string, params?: unknown[]): T[];
 }

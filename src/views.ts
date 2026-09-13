@@ -156,6 +156,7 @@ export class ViewHub {
     return {
       name,
       version: def.version,
+      table: inst.table,
       rebuild: () => this.rebuild(name),
       query: <T = Row>(sql: string, params?: unknown[]): T[] => {
         if (inst.faulted)
