@@ -1,6 +1,6 @@
-# SPEC amendments — v3.7 candidates (P29–)
+# SPEC amendments — P29 (ratified as v3.7)
 
-> Status: **PROPOSED, not ratified.** Items below are implemented in-tree but not yet stamped into [SPEC.md](../SPEC.md) or [CHANGELOG.md](../CHANGELOG.md). Per the standing convention, SPEC is frozen between stamps and amendments accumulate here first.
+> Status: **RATIFIED as SPEC v3.7** (2026-09-13). P29 is applied in [SPEC.md](../SPEC.md) §14 and stamped in [CHANGELOG.md](../CHANGELOG.md). This file is retained as the amendment rationale record. The editorial de-branding pass recorded at the end shipped in the same cycle.
 >
 > Discovery path for this cycle: **documentation**. v3.3 came from building the vectors and harness, v3.4 from failing P7 runs, v3.5/v3.6 from the ADHDev production integration — P29 came from writing a README quickstart and discovering the example could not be written using public API at all. That is a fourth distinct path, and a cheap one: the first honest "how do I use this" walkthrough is itself a surface audit.
 

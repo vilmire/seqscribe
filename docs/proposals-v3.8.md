@@ -1,6 +1,8 @@
-# SPEC amendments — v3.8 candidates (P30–P34)
+# SPEC amendments — P30–P34 (P30–P33 ratified as v3.7; P34 open)
 
-> Status: **P30–P33 IMPLEMENTED (2026-09-13), none ratified. P34 remains PROPOSED only.** Nothing here is in SPEC.md or CHANGELOG.md yet; the per-item "Status" markers below record what was actually built, including where it diverged from the proposal. Per the standing convention, SPEC is frozen between stamps and amendments accumulate here first.
+> Status: **P30–P33 RATIFIED as SPEC v3.7** (2026-09-13) — applied in [SPEC.md](../SPEC.md) §5.7/§11.1/§14/§14.1/§14.2 and stamped in [CHANGELOG.md](../CHANGELOG.md). **P34 is NOT ratified and NOT implemented** (see its own status). This file is retained as the amendment rationale record; the per-item "Status" markers record what was actually built, including where it diverged from the proposal.
+>
+> Ratification followed the v3.5/v3.6 discipline: the SPEC text was written from the **implementation**, not from the proposals above. Two places where the two disagreed, with the SPEC following the code: P31's `readIntervalStats()` copies each counter object (the proposal did not mention it — the defect was found while implementing, and the SPEC now states the MUST), and P33 landed as the in-source caller warning plus normative §11.1/§14 text, with the proposal's remedy (2) explicitly not taken.
 >
 > Discovery path for this cycle: **reading the embedder's integration layer instead of waiting for it to report.** Every previous cycle arrived as a report — a failing run (v3.4), an incident or a blocked phase (v3.5/v3.6), a README that could not be written (v3.7). This one came from reading the ~11,400 lines of host glue in the production integration's `seqscribe/` directory and asking a different question: *where is the host paying a standing cost the library could absorb?* That cost is visible in the glue's own comments, which document each workaround and why it was necessary. None of the five below was ever filed as a request — the host worked around them and moved on, which is exactly why they persisted.
 >

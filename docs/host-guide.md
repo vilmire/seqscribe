@@ -1,6 +1,6 @@
 # seqscribe host integration guide — the host's contract obligations
 
-> Status: **non-normative companion to SPEC v3.6** (2026-08-28). The SPEC deliberately pushes identity, trust, signing, and adjudication to the host; those obligations are stated where each mechanism is defined and are therefore scattered. This document collects them into one place, per host role, with runbooks for the situations where the host is the only actor that can act. Where this guide and the SPEC disagree, the SPEC wins. This is the *generic* host contract; integration work specific to any one embedder belongs in that embedder's own repo (DESIGN §9.5).
+> Status: **non-normative companion to SPEC v3.7** (2026-09-13). The SPEC deliberately pushes identity, trust, signing, and adjudication to the host; those obligations are stated where each mechanism is defined and are therefore scattered. This document collects them into one place, per host role, with runbooks for the situations where the host is the only actor that can act. Where this guide and the SPEC disagree, the SPEC wins. This is the *generic* host contract; integration work specific to any one embedder belongs in that embedder's own repo (DESIGN §9.5).
 
 ## 0. Helpers that implement this guide (src/host.ts)
 
