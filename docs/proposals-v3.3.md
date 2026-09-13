@@ -1,6 +1,6 @@
 # Proposed SPEC amendments — v3.3 candidates
 
-> Status: **RATIFIED as SPEC v3.3** (2026-08-26, at implementation start — the owner's "구현작업 시작" directive accepted the blocking proposals; P1 was a hard prerequisite for milestone ⓪). All four items are applied in [SPEC.md](../SPEC.md) and stamped in [CHANGELOG.md](../CHANGELOG.md); the test-vectors §7 values are now authoritative. This file is retained as the amendment rationale record. Originally surfaced by building the known-answer vectors ([test-vectors.md](test-vectors.md) §8) and designing the simulation harness ([harness.md](harness.md)).
+> Status: **RATIFIED as SPEC v3.3** (2026-08-26, at implementation start — the owner's "begin implementation" directive accepted the blocking proposals; P1 was a hard prerequisite for milestone ⓪). All four items are applied in [SPEC.md](../SPEC.md) and stamped in [CHANGELOG.md](../CHANGELOG.md); the test-vectors §7 values are now authoritative. This file is retained as the amendment rationale record. Originally surfaced by building the known-answer vectors ([test-vectors.md](test-vectors.md) §8) and designing the simulation harness ([harness.md](harness.md)).
 
 ---
 
