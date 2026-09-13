@@ -1,7 +1,11 @@
 # Contributing
 
-seqscribe is maintained for [ADHDev](https://adhf.dev)'s needs first and is
-pre-release; external contributions are welcome but the bar below is fixed.
+seqscribe is a general-purpose library, but it is maintained for
+[ADHDev](https://adhf.dev)'s needs first and is pre-release. In practice that
+sets priorities, not scope: bug reports and fixes are welcome anywhere in the
+SPEC surface, while new features compete against the needs of the system the
+library was extracted from — so open an issue before building something large.
+External contributions are welcome; the bar below is fixed.
 
 ## The contract comes first
 

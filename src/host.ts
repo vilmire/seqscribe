@@ -319,8 +319,9 @@ export function loadOrCreateWriterId(
 
 // ---- legacy JSONL migration ----
 
-// Genesis migration for pre-seqscribe JSONL logs (e.g. the ADHDev mesh
-// ledger): each line becomes an ordinary append on THIS node's stream —
+// Genesis migration for pre-seqscribe JSONL logs (the append-only-file-plus-
+// derived-SQLite shape applications tend to grow on their own): each line
+// becomes an ordinary append on THIS node's stream —
 // chains/hlc/seq are minted fresh, which is the point (the legacy file had
 // none). Run once per legacy file, on the machine that owned it.
 export async function migrateLegacyJsonl(

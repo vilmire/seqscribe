@@ -11,15 +11,17 @@
 
 ---
 
-## 1. Motivation — three internal ADHDev consumers
+## 1. Motivation — three workload shapes
 
-| Consumer | Use | When |
+seqscribe was designed against three concrete workloads, which remain the shapes its design envelope is accountable for. They are stated generically here because each recurs far outside the system they were drawn from; the originating consumers (from ADHDev, the project this library was extracted from) are named in the right-hand column as provenance.
+
+| Workload shape | Use | Originating consumer |
 |---|---|---|
-| Fleet Assistant journals | converging per-machine append-only journals across the fleet | assistant phase 2 |
-| Repo Mesh event log / ledger | durable event log + cursor delivery replaces the pending/outbox/redrive compensation machinery; multi-machine ledger survivability | mesh refactor |
-| Dashboard replica (Tier 2) | browser holds only subscribed slices of ledger/fleet views; offline reading | later |
+| **Per-machine journals converging across a fleet** | append-only journals authored independently on each machine, readable everywhere | Fleet Assistant journals |
+| **Durable event log + cursor delivery** | replaces pending/outbox/redrive compensation machinery with a property of the data model; multi-machine ledger survivability | Repo Mesh event log / ledger |
+| **Thin subscribed replica (Tier 2)** | a browser holds only the slices of a view it subscribed to, readable offline | Dashboard replica |
 
-Three hand-rolled precedents already exist: daemon-p2p chat-tail subscriptions (seq/cursors), the TopicSubscriptionRegistry, and status flushes — all ad-hoc Tier-2 implementations. The mesh ledger has likewise organically converged on JSONL-append + derived SQLite (mesh-runtime.db). **seqscribe is not an invention; it is the extraction and generalization of these patterns.**
+The generalizable observation is that all three had already been hand-rolled, badly, three separate times: chat-tail subscriptions with ad-hoc seq/cursors, a topic-subscription registry, and periodic status flushes — each an incomplete Tier-2 implementation. The event ledger had likewise organically converged on JSONL-append plus derived SQLite. That convergence is the argument for the library: **seqscribe is not an invention; it is the extraction and generalization of patterns that applications keep reinventing.** If your system has grown an append-only log with derived read models and a bespoke catch-up protocol, it is the same shape.
 
 ## 1.5 Design envelope (2026-08-26 — scale review)
 
@@ -44,7 +46,7 @@ Beyond the envelope (thousands of nodes) is an explicit non-goal. Envelope claim
 2. **Cursors replace delivery** — "guaranteed storage + cursor resumption" instead of "guaranteed delivery". A delivery failure is just a cursor that hasn't advanced yet.
 3. **Idempotent application** — (writerId, seq) is the event id; duplicates are harmless.
 4. **Derived artifacts are rebuildable** — SQLite views/indexes can always be rebuilt from the log. The log is the only truth.
-5. **Transport and storage are injected** — the library accepts only an already-connected bidirectional channel and a storage interface. Peer discovery, auth, NAT traversal are the host's job (ADHDev brings its existing WebRTC/TURN stack).
+5. **Transport and storage are injected** — the library accepts only an already-connected bidirectional channel and a storage interface. Peer discovery, auth, NAT traversal are the host's job — a host that already operates a WebRTC/TURN stack, a WebSocket mesh, or an SSH fabric hands seqscribe the connected channel and keeps its existing transport investment.
 6. **No consensus** — AP only (availability + partition tolerance). Eventual convergence is the only promise.
 
 ## 3. Competitive map & why-not (2026-08-25 survey)
@@ -102,15 +104,15 @@ access:      content (P2P only) | metadata (server peers allowed)   ← enforces
              content boundary as a topic classification
 ```
 
-ADHDev topic layout (the complete target design — implementation presumes this entire table):
+A worked topic layout — the reference deployment the implementation is sized against, and a template for mapping your own workloads onto the four policy axes. Every policy combination below is exercised by the test suite and the browser e2e:
 
-| Topic | Retention | Replication | Access | Replaces |
+| Topic | Retention | Replication | Access | Why this combination |
 |---|---|---|---|---|
-| mesh.ledger / mesh.events | full | full-sync | metadata envelope | JSONL ledger + pending/outbox/redrive |
-| assistant.journal | full | full-sync | content | (new) |
-| session.transcript | ring | subscribe-only | content | chat-tail subscription machinery |
-| fleet.status | ring | subscribe-only | metadata | status flush / TopicSubscriptionRegistry |
-| config.settings | full | full-sync | content | per-machine files (gains fleet-wide sync + audit) |
+| mesh.ledger / mesh.events | full | full-sync | metadata envelope | durable event log, every node holds all of it; replaces an outbox/redrive layer |
+| assistant.journal | full | full-sync | content | independently authored per-machine journals, readable fleet-wide |
+| session.transcript | ring | subscribe-only | content | long append stream only the tail of which matters; readers don't keep a replica |
+| fleet.status | ring | subscribe-only | metadata | high-churn latest-state, server-visible, bounded memory |
+| config.settings | full | full-sync | content | small, audited, fleet-wide — a register topic's natural shape |
 
 Subscriber matrix: browsers (memory/OPFS), daemon→daemon (remote session tails), server/DO (metadata class only), assistant/MCP (in-process views), push pipeline (events → notifications).
 
@@ -146,7 +148,7 @@ GET-VECTORS { } → every node's last vector + hints (+ report times)
 3. Sole-copy awareness — a node (or host UI) knows it holds entries nobody else has while going offline.
 
 **Two grades of third point (pluggable — host's choice):**
-- **Cloud beacon** (ADHDev Workers/DO): content-free vector board. Fully consistent with the content boundary; ~zero cost. The default advantage for cloud users.
+- **Cloud beacon** (a serverless worker / Durable Object — `beaconFetchHandler` ships for exactly this): content-free vector board. Fully consistent with the content boundary; ~zero cost. The default advantage for hosts that already run cloud infrastructure.
 - **Self-hosted always-on peer**: run a normal seqscribe node on an always-reachable machine (Tailscale etc.) — a strict superset of the beacon (vectors + full-sync relay). No separate implementation; a normal node is the role.
 - None: sync unaffected; prediction gracefully degrades to peer-overlap moments (HELLO exchange).
 
@@ -179,7 +181,7 @@ node.onConflict("config.settings", async (c) => {
 - Until resolution, the default policy's **provisional winner** applies — the system never stalls.
 - "resolver" on a key with no registered resolver = keep the provisional winner + surface the conflict event only (de-facto manual resolution queue).
 
-**The fourth policy — `owned` (owner proposal, 2026-08-26):** one owner (nodeId) per key/topic — only the owner writes; conflicts become **impossible by definition**. This lifts the writer-owned-log principle to the data level and codifies ADHDev's implicit discipline (machine config = that machine; transcripts = hosting daemon; task state = coordinator).
+**The fourth policy — `owned` (owner proposal, 2026-08-26):** one owner (nodeId) per key/topic — only the owner writes; conflicts become **impossible by definition**. This lifts the writer-owned-log principle to the data level. It codifies a discipline most fleets already follow implicitly — a machine's own config is written by that machine, a session's transcript by the daemon hosting it, shared task state by the coordinator — and turns it from a convention that can be violated into one the library enforces.
 - Initial owner = first author. **Transfer (chown) is an event only the current owner can append** — transfer itself is single-writer, hence conflict-free (the recursion closes).
 - Non-owner writes: policy choice — `reject` (local refusal) or `request` (write-request queued → applied/approved when the owner returns — an async approval model).
 - **Cost (explicit)**: owner offline = that key is unwritable (per-key CP). Recommended only for keys with natural affinity; never the default.
@@ -202,7 +204,7 @@ node.onConflict("config.settings", async (c) => {
 - Separate repo (`vilmire/seqscribe`), **dual FSL-1.1-Apache-2.0 OR AGPL-3.0-only** (originally stamped MIT; → FSL, then → dual, both 2026-08-26 before any implementation release. The AGPL leg exists so the AGPL ADHDev OSS tier can depend on seqscribe directly — the unified single-data-plane architecture — while the FSL leg keeps embedding permissive and both legs block free-riding. The MIT npm placeholder 0.0.1 predates the implementation and carries none of it). Candidate third submodule for the ADHDev monorepo.
 - Packages: `seqscribe` (core, pure TS) / `seqscribe-ws` (reference transport) / `seqscribe-beacon` (reference beacon, §5.7) / storage adapters (`@seqscribe/*` or `seqscribe-*`).
 - npm name `seqscribe` reserved (placeholder 0.0.1 published 2026-08-26). GitHub org `seqscribe` secured.
-- Positioning: "extracted from ADHDev, maintained for our needs" — keeps the maintenance debt proportional to scope.
+- Positioning: "extracted from ADHDev, maintained for our needs" — keeps the maintenance debt proportional to scope. This is a statement about **maintenance priority, not generality**: the SPEC is written as a standalone contract implementable by anyone, with no ADHDev concept in the wire protocol, storage schema, or API surface. What the positioning buys is the right to decline feature requests, not a narrower library.
 
 ## 9. Implementation policy — complete design first (owner decision, 2026-08-25)
 
@@ -237,7 +239,7 @@ Decision 3: snapshots per-writer → **topic-level total-order cuts** (reducer s
 7. **No npm aliases.** Single identity: seqscribe. GitHub org secured.
 8. **Total order = HLC.** Deterministic (hlc, writerId, seq) order + suffix recomputation for late arrivals (cost bounded by checkpoint spacing). Over-ε receipts: **keep stamps for storage/ordering; do not merge into the local clock; flag** (clamping/re-stamping breaks determinism — precise rules in SPEC §3). Forcing order-independent reducers rejected (shifts burden to consumers). Semantic-conflict arbitration is the host's (§7) — merging only promises fact preservation.
 9. **Register conventions = §5.8.** Key-level set/add/remove events (whole-file LWW forbidden). Causal attachment is the lightweight per-key last-seen (writer, seq). Conflicts surfaced via `*.conflict` + log-preserved restoration. **Ownerless is the default** — unowned keys flow through lww/fww/resolver.
-10. **Beacon = minimal, piggybacked.** Push = 5 s debounce after append + heartbeat piggyback (silent when idle). Key hints plaintext by default with `hintKeys:"hash"` option. Auth is the host's — ADHDev piggybacks vectors on the existing status_report/DO channel; the reference beacon is an `npx seqscribe beacon` subcommand.
+10. **Beacon = minimal, piggybacked.** Push = 5 s debounce after append + heartbeat piggyback (silent when idle). Key hints plaintext by default with `hintKeys:"hash"` option. Auth is the host's — a host with an existing status/heartbeat channel can piggyback vectors on it rather than running anything new; the reference beacon is an `npx seqscribe beacon` subcommand for hosts that have no such channel.
 11. **Conflict-policy details.** fww = earliest wins among concurrent pairs only (not immutable-once-set — causal successors apply normally; use resolver/owned for immutability). Resolver runs on any detecting node (designated-node model rejected for offline stalls) — resolve-event races settle by LWW. resolve schema = `{kind:"resolve", key, supersedes:[(writer,seq)…], value}`.
 12. **Anti-entropy + K-peer fan-out.** Periodic HAVE re-exchange every 5 min (repair path). Eager push to K=3–5 preferred peers + transitive propagation.
 13. **Writer retirement.** Seal → absorb into snapshot → remove from vectors. 30-day grace (unseal on return). Includes bulk ownership transfer (host arbitration if no target).
