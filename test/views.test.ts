@@ -73,8 +73,7 @@ describe("view materialization", () => {
     void node.log(T).append("a", {});
     void node.log(T).append("b", {});
     await sched.run();
-    const hub = (node as unknown as { _views: { get: (n: string) => { table: string } } })._views;
-    const table = hub.get("counts").table;
+    const table = h.table;
     const out = h.query<{ kind: string; n: number }>(`SELECT * FROM "${table}" ORDER BY kind`);
     expect(out).toEqual([
       { kind: "a", n: 2 },
@@ -92,18 +91,12 @@ describe("view materialization", () => {
         deletes: [],
       }),
     };
-    node.view("counts", T, withDelta);
+    const h = node.view("counts", T, withDelta);
     for (let i = 0; i < 7; i++) void node.log(T).append(i % 2 === 0 ? "a" : "b", {});
     await sched.run();
-    const hub = (node as unknown as { _views: { get: (n: string) => { table: string } } })._views;
-    const table = hub.get("counts").table;
-    const rows = coreOf(node)
-      ? (node.view === undefined
-          ? []
-          : ((node as unknown as { _core: { store: { raw: () => { all: Function } } } })._core.store
-              .raw()
-              .all(`SELECT * FROM "${table}" ORDER BY kind`) as { kind: string; n: number }[]))
-      : [];
+    const rows = h.query<{ kind: string; n: number }>(
+      `SELECT * FROM "${h.table}" ORDER BY kind`,
+    );
     expect(rows).toEqual([
       { kind: "a", n: 4 },
       { kind: "b", n: 3 },
@@ -118,12 +111,11 @@ describe("view materialization", () => {
       ...countView,
       delta: () => ({ upserts: [{ kind: "wrong", n: 999 }], deletes: [] }),
     };
-    node.view("counts", T, lying);
+    const h = node.view("counts", T, lying);
     for (let i = 0; i < 4; i++) void node.log(T).append("a", {});
     await sched.run();
     expect(anomalies.some((a) => a.kind === "delta_mismatch")).toBe(true);
-    const hub = (node as unknown as { _views: { get: (n: string) => { table: string } } })._views;
-    const table = hub.get("counts").table;
+    const table = h.table;
     const rows = (node as unknown as { _core: { store: { raw: () => { all: Function } } } })._core.store
       .raw()
       .all(`SELECT * FROM "${table}"`) as { kind: string; n: number }[];
@@ -133,7 +125,7 @@ describe("view materialization", () => {
   it("recomputes the suffix on a late arrival (total order beats arrival order)", async () => {
     const sched = new Scheduler(1_000_000);
     const { node } = makeNode(sched);
-    node.view("last", T, lastView);
+    const h = node.view("last", T, lastView);
 
     // own entries at "current" time
     void node.log(T).append("note", { v: "own-final" });
@@ -154,8 +146,7 @@ describe("view materialization", () => {
     void coreOf(node).applyExternal(late, "peer");
     await sched.run({ untilMs: 1_001_000 });
 
-    const hub = (node as unknown as { _views: { get: (n: string) => { table: string } } })._views;
-    const table = hub.get("last").table;
+    const table = h.table;
     const rows = (node as unknown as { _core: { store: { raw: () => { all: Function } } } })._core.store
       .raw()
       .all(`SELECT * FROM "${table}"`) as { id: string; v: string }[];

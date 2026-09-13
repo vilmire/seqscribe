@@ -46,9 +46,7 @@ describe("fts views (§9)", () => {
     void node.log(T).append("note", { text: "quick thinking wins" });
     await sched.run();
 
-    const table = (node as unknown as { _views: { get(n: string): { table: string } } })._views.get(
-      "notes",
-    ).table;
+    const table = h.table;
     const hits = h.query<{ id: string }>(
       `SELECT id FROM "${table}_fts" WHERE "${table}_fts" MATCH 'quick' ORDER BY id`,
     );

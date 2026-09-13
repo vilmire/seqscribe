@@ -67,9 +67,7 @@ async function exerciseNode(storage: SqliteHandle): Promise<void> {
   await sched.run();
 
   expect(coreOf(node).getStream(T, "wA").contigSeq).toBe(5);
-  const table = (node as unknown as { _views: { get(n: string): { table: string } } })._views.get(
-    "counts",
-  ).table;
+  const table = h.table;
   expect(h.query(`SELECT * FROM "${table}" ORDER BY kind`)).toEqual([
     { kind: "a", n: 3 },
     { kind: "b", n: 2 },

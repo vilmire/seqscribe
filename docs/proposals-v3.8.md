@@ -1,4 +1,4 @@
-# SPEC amendments — P30–P34 (P30–P33 ratified as v3.7; P34 open)
+# SPEC amendments — P30–P36 (P30–P33, P35–P36 ratified as v3.7; P34 open)
 
 > Status: **P30–P33 RATIFIED as SPEC v3.7** (2026-09-13) — applied in [SPEC.md](../SPEC.md) §5.7/§11.1/§14/§14.1/§14.2 and stamped in [CHANGELOG.md](../CHANGELOG.md). **P34 is NOT ratified and NOT implemented** (see its own status). This file is retained as the amendment rationale record; the per-item "Status" markers record what was actually built, including where it diverged from the proposal.
 >
@@ -158,6 +158,32 @@ This also explains why **P27's `keyStale` could ship inert for two revisions**: 
 
 ---
 
+---
+
+## P35 — the archive's storage form was specified as a filesystem path two shipped adapters cannot write (§7.6)
+
+§7.6 named the cold archive `archive/<topic>.jsonl.gz` from v3.2 through v3.6. The library has never written it: archived rows move to a sibling `sq_archive` table, and `src/archive.ts` carried a comment calling the file form "an adapter concern" — i.e. the implementation knew it diverged and proceeded anyway, which is the state v3.5's ratification discipline exists to prevent.
+
+The divergence is not laziness; **the SPEC text is the part that is wrong.** §14 requires the library to run on storage adapters that have no filesystem at all — a browser on sqlite-wasm/OPFS and a Cloudflare Durable Object. A conforming implementation therefore had to violate the letter of §7.6 in order to satisfy §14, and any second implementor reading §7.6 literally would either write a file nobody reads or conclude the two sections contradict each other.
+
+**Amendment**: §7.6 no longer names a storage form. What stays normative is the **behavior** — archived entries leave the hot log, remain locally retrievable, remain reachable through the §14.1 writer-form `scanEntries` (which spans the archive), and are drainable via `export`. Where they physically live is a storage-adapter concern, stated as such.
+
+**Status: implemented 2026-09-13** (documentation only — the code was already correct). §7.6 rewritten; `sq_archive` named as the reference implementation's choice rather than as the contract. No behavior change, no test change, no hashed input moves.
+
+---
+
+## P36 — `RegisterSnapshotState` silently omits pending requests (§11.6)
+
+`pendingRequests()` reads live register state, but `RegisterSnapshotState` has no `requests` field, so a node that bootstraps from a **snapshot** rather than replaying the log does not see `owned` requests made below the cut. The owner's approval UI never lists them, and an owner who approves only what it can see never approves them.
+
+This was previously tracked as a known gap with the parenthetical "a spec-level decision" — but the decision was recorded nowhere in the SPEC, so the omission read as an oversight to anyone comparing §11.4 against §11.6.
+
+**Amendment**: state the decision and its consequence in §11.6 rather than changing behavior. Requests are ordinary log entries with a `REQUEST_TTL_MS` (30 d) lifetime; the requester's remedy is to re-request, which is one append, and the TTL bounds how long the gap can matter. Carrying them would replicate *unapproved* host-policy state into the compaction artifact — state whose only consumer is a live owner's UI — to close a window the requester can close itself.
+
+**Status: implemented 2026-09-13** (documentation only). §11.6 gains the explicit non-field note. Behavior unchanged — this converts an undocumented silence into a stated decision, which is what makes a second implementation match the first.
+
+---
+
 ## Summary
 
 | # | Gap | Host cost today | Fix size |
@@ -169,6 +195,8 @@ This also explains why **P27's `keyStale` could ship inert for two revisions**: 
 | **P32** | `Anomaly` carries no topic/peer/view/consumer | **Implemented** — five optional fields, populated at every emit site with the identifier in scope |
 | **P33** | One synchronous throw in an otherwise-async `append` | **Implemented** (remedy 1, documentation). §14 amendment text still to write at ratification |
 | **P34** | `staleness()` has no reader for the features it feeds | **Not implemented** — shape uncertain, deferred for a second embedder |
+| **P35** | §7.6 named a filesystem archive path two shipped adapters cannot write | **Implemented** (doc only) — §7.6 now specifies behavior, not storage form |
+| **P36** | `RegisterSnapshotState` omits pending requests, undocumented | **Implemented** (doc only) — the decision and its remedy are now stated |
 
 `npm run check` green across all of it: 275 tests (up from 271), strict `types.d.ts` pass, fixture consumability gate.
 

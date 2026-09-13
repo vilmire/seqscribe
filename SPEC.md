@@ -2,7 +2,7 @@
 
 > Status: **v3.7** (2026-09-13, host-surface amendments — [docs/proposals-v3.7.md](docs/proposals-v3.7.md) P29 and [docs/proposals-v3.8.md](docs/proposals-v3.8.md) P30–P33 ratified). Supersedes the v3.6 stamp below.
 >
-> **v3.7 changes against v3.6.** Five items, all on the **host-facing surface**: nothing here touches the wire protocol, the storage schema, replication, conflict, or chain semantics, and **no hash input moves** — the test vectors remain valid unchanged. Four are additive; one (P31) changes the behavior of a shipped call and is flagged as such.
+> **v3.7 changes against v3.6.** Seven items. Five are on the **host-facing surface**; two (P35, P36) close long-standing divergences between this document and the implementation, in both cases because **this document was the part that was wrong**. nothing here touches the wire protocol, the storage schema, replication, conflict, or chain semantics, and **no hash input moves** — the test vectors remain valid unchanged. Four are additive; one (P31) changes the behavior of a shipped call and is flagged as such.
 >
 > | Item | What | Where |
 > |---|---|---|
@@ -11,6 +11,8 @@
 > | P31 | **`stats()` is now a pure read**; the interval reset moves to `drainSyncInterval()`. P24's drain-on-read made the *number of callers* part of the semantics | §14.1 |
 > | P32 | `Anomaly` gains optional `topic`/`peerId`/`writer`/`view`/`consumer` — naming only the kind left the feed unactionable | §14.1 |
 > | P33 | The caller hazard created by `append`'s one surviving synchronous throw, stated normatively (§11.1 itself is unchanged) | §11.1, §14 |
+> | P35 | §7.6 no longer names `archive/<topic>.jsonl.gz` — a filesystem path two of the three shipped storage adapters cannot write. Archive **behavior** is normative; storage form is an adapter concern | §7.6 |
+> | P36 | `RegisterSnapshotState`'s absent `requests` field was a real decision recorded nowhere; now stated with its remedy | §11.6 |
 >
 > **⚠ P31 is not byte-compatible.** A host that relied on `stats()` draining the P24 interval counters now reads cumulative values. The direction is strictly safer — a correct single-reader host observes *more* than before, never less — and the previous semantics remain available verbatim via `drainSyncInterval()`. It is called out here rather than folded in silently because it is the only behavioral change in this revision.
 >
@@ -324,7 +326,7 @@ interface FinalityCert {
 - On accepting a higher cert: (a) quarantine applied entries with `order ≤ P` and `seq > cut[w].seq` (non-canonical late region). **This transition is fully defined**: contig rewinds to `cut[w].seq`; the quarantined seqs remain permanently consumed (the (topic,writer,seq) namespace is never reused); the stream seals `'fork'`-equivalent (`onAnomaly('writer_forked')`) — its author's subsequent appends chain from quarantined entries no node can verify, so **only a WriterDirective resolves it** (§12: canonicalize at the cut, author continues under a new writerId). The author's own node applies the same rule to its own stream; (b) **where local `contig ≥ cut[w].seq`, verify the local chain at `cut[w].seq` equals `cut[w].chain`** — a mismatch means the local prefix diverged inside the covered region (a fork the cert reached before detection): route to the §12 recovery procedure (quarantine to last matching point, rewind, re-fetch canonical); after such cert-driven recovery **the stream remains `'fork'`-sealed awaiting a WriterDirective** (§18). Local `contig < cut[w].seq` is NOT a mismatch — the topic is in the **"verified, basis pending"** state (cert held, coverage catching up via sync/bootstrap); (c) rebuild affected views from the snapshot/checkpoint at or before the cut. All nodes converge to: canonical covered prefix + live post-P region.
 - **Provisional delivery**: entries delivered to `onEntry` before finality are provisional. When a cert quarantines an already-delivered entry, the library emits `onAnomaly({kind:"entry_quarantined", entry})` per entry; **the anomaly is a volatile callback and is NOT a reliable compensation channel** (an offline consumer misses it) — consumers with irreversible side effects MUST use finalized-only consumption (gate on `finality(topic)`, consuming only entries at order ≤ the local watermark); compensation-on-anomaly is best-effort hygiene, never the correctness mechanism. **Latency consequence (explicit)**: finalized-only consumption waits up to FINALITY_WINDOW_MS (default 30 days) — finality exists for **compaction safety**, not consumer ordering. Most consumers are provisional by design; a consumer that is both irreversible and timely needs host-level compensation, and no spec mechanism removes that trade-off.
 
-**7.6 Compaction — two separate disciplines.** (1) **Certificate effects are immediate**: enforcement and quarantine happen on cert acceptance. (2) **Cold archiving lags locally**: moving pre-P entries to `archive/<topic>.jsonl.gz` (local only) waits until every registered `onEntry` consumer's cursor passes them; a consumer idle past FINALITY_WINDOW_MS is dropped (`onAnomaly('consumer_abandoned')`), and its later resume resets its cursor to the first post-cut rowid. Cut state = permanent base checkpoint; pre-P checkpoints prune.
+**7.6 Compaction — two separate disciplines.** (1) **Certificate effects are immediate**: enforcement and quarantine happen on cert acceptance. (2) **Cold archiving lags locally**: moving pre-P entries **out of the hot log into cold storage** (local only) waits until every registered `onEntry` consumer's cursor passes them; a consumer idle past FINALITY_WINDOW_MS is dropped (`onAnomaly('consumer_abandoned')`), and its later resume resets its cursor to the first post-cut rowid. Cut state = permanent base checkpoint; pre-P checkpoints prune. **★v3.7 (P35): the archive's STORAGE FORM is deliberately unspecified.** v3.2–v3.6 named `archive/<topic>.jsonl.gz`, a filesystem path that two of the three shipped storage adapters cannot write at all — a browser on sqlite-wasm/OPFS and a Cloudflare Durable Object have no such filesystem — so a conforming implementation had to violate the letter of this section to run where §14 says it must run. What is normative is the **behavior**: archived entries leave the hot log, stay locally retrievable, remain reachable by the §14.1 writer-form `scanEntries` (which spans the archive), and are drainable through `export`. Where they physically live is a storage-adapter concern. The reference implementation uses a sibling `sq_archive` table, which satisfies all four properties with no filesystem dependency.
 
 **7.7 SnapshotBody.**
 
@@ -513,6 +515,15 @@ interface RegisterSnapshotState {
     superseded?: EntryId[];
   }>;
 }
+// ★v3.7 (P36): there is deliberately NO `requests` field. Pending `owned` requests
+// (§11.4) are ordinary log entries with a REQUEST_TTL_MS lifetime, so a node that
+// bootstraps from a SNAPSHOT rather than replaying the log does not see requests made
+// below the cut: `pendingRequests()` omits them and an owner that approves only what it
+// can see will never approve them. The requester's remedy is to re-request, which is one
+// ordinary append, and the request's own TTL bounds how long the gap can matter.
+// Carrying them would mean replicating *unapproved* host-policy state into the
+// compaction artifact — state whose only consumer is a live owner's UI — for a window
+// the requester can close itself. Stated here because the silence read as an oversight.
 ```
 
 **11.7 Override globs.** Patterns are exact keys or prefix globs (`prefix.*` — a literal prefix followed by `.*`; no other wildcard forms). Precedence: exact match > longest matching prefix. The pattern set and this matching rule are part of topicSchemaHash (identical logs + different matching would diverge views).

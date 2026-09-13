@@ -82,7 +82,7 @@ try {
   const cfgSub = node.subscribe(peer, { view: "register", params: { topic: "config.settings" } });
   cfgSub.onSnapshot((rows) => (configRows = rows));
 
-  const table = node._views.get("ledger").table;
+  const table = ledger.table;
   const tick = () => {
     const meshContig = coreOf(node).getStream("mesh.events", "coordinator").contigSeq;
     const ledgerRows = ledger.query(

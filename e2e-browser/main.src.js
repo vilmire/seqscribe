@@ -57,7 +57,7 @@ try {
   while (!converged() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
 
   await new Promise((r) => setTimeout(r, 300)); // let the view materialize
-  const table = node._views.get("counts").table;
+  const table = view.table;
   const rows = view.query(`SELECT * FROM "${table}" ORDER BY kind`);
 
   // Tier-2 path: subscribe to the SERVER's view over the same socket (the
