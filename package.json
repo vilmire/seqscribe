@@ -29,6 +29,7 @@
   "files": [
     "dist",
     "bin",
+    "assets",
     "README.md",
     "LICENSE",
     "LICENSE-FSL",

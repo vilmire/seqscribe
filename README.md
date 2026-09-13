@@ -1,3 +1,5 @@
+<img src="assets/seqscribe-mark.svg" width="120" alt="Three writer-owned chains converging into a single head">
+
 # seqscribe
 
 > Pronounced **"seek-scribe"** — **seq**uence + sub**scribe** + *scribe* (every stream has exactly one writer).

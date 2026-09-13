@@ -32,7 +32,7 @@ node.view("counts", T, {
 // backlog the browser must pull
 for (let i = 0; i < 10; i++) node.log(T).append("server-note", { i });
 
-const MIME = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm", ".json": "application/json" };
+const MIME = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm", ".json": "application/json", ".svg": "image/svg+xml" };
 const server = createServer((req, res) => {
   const path = new URL(req.url, "http://x").pathname;
   if (path === "/state") {
@@ -41,7 +41,7 @@ const server = createServer((req, res) => {
     return;
   }
   const file = path === "/" ? "/index.html" : path;
-  const candidates = [join(HERE, file), join(ROOT, "node_modules", file.slice(1))];
+  const candidates = [join(HERE, file), join(ROOT, file.slice(1)), join(ROOT, "node_modules", file.slice(1))];
   for (const c of candidates) {
     try {
       const body = readFileSync(c);

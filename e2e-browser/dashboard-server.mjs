@@ -76,7 +76,7 @@ setInterval(() => {
   void reg.set("deploy.channel", Math.random() < 0.5 ? "stable" : "canary");
 }, 2_000);
 
-const MIME = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm", ".json": "application/json" };
+const MIME = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm", ".json": "application/json", ".svg": "image/svg+xml" };
 const server = createServer((req, res) => {
   const path = new URL(req.url, "http://x").pathname;
   if (path === "/state") {
@@ -85,7 +85,7 @@ const server = createServer((req, res) => {
     return;
   }
   const file = path === "/" ? "/dashboard.html" : path;
-  for (const c of [join(HERE, file), join(ROOT, "node_modules", file.slice(1))]) {
+  for (const c of [join(HERE, file), join(ROOT, file.slice(1)), join(ROOT, "node_modules", file.slice(1))]) {
     try {
       const body = readFileSync(c);
       res.writeHead(200, { "content-type": MIME[extname(c)] ?? "application/octet-stream" });

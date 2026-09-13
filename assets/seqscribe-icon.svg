@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64"
+     role="img" aria-label="seqscribe">
+  <title>seqscribe</title>
+  <!-- Square variant of the mark for favicons and avatars. Same idea — writer-owned
+       chains converging — but reduced to two entries per stream and a shorter tail,
+       because the wide mark's third column closes up into a smudge below ~24px.
+       A favicon has no surrounding text to inherit from, so the colour is literal
+       rather than currentColor, and it is the same mid-grey that stays legible on
+       both a light and a dark browser tab strip. -->
+  <g fill="none" stroke="#7d8590" stroke-width="5"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M10 14h14" />
+    <path d="M10 32h14" />
+    <path d="M10 50h14" />
+    <path d="M24 14C38 14 38 32 48 32" />
+    <path d="M24 32h24" />
+    <path d="M24 50C38 50 38 32 48 32" />
+  </g>
+  <g fill="#7d8590">
+    <circle cx="10" cy="14" r="5" /><circle cx="24" cy="14" r="5" />
+    <circle cx="10" cy="32" r="5" /><circle cx="24" cy="32" r="5" />
+    <circle cx="10" cy="50" r="5" /><circle cx="24" cy="50" r="5" />
+    <circle cx="52" cy="32" r="8" />
+  </g>
+</svg>

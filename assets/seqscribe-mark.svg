@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 64" width="96" height="64"
+     role="img" aria-label="seqscribe: writer-owned chains converging">
+  <title>seqscribe — writer-owned chains converging</title>
+  <!-- Three writer-owned hash chains, each advancing on its own, meeting in a
+       shared converged head. Convergence, not consensus: no stream gives up its
+       ownership to join.
+
+       Colour: a mid-grey that stays legible on white AND on GitHub's #0d1117, so
+       one file covers light and dark with no media query. It is set literally
+       (via `color` on the group, which `currentColor` then resolves against)
+       because CSS cannot reach inside an SVG referenced by <img> — a
+       currentColor-only file renders black and vanishes on a dark README. When
+       INLINING this markup instead, drop the `color` attributes and it will
+       inherit the surrounding text colour.
+       Nothing here needs fonts, scripts, or external assets. -->
+  <g color="#7d8590"
+     fill="none" stroke="currentColor" stroke-width="4"
+     stroke-linecap="round" stroke-linejoin="round">
+    <!-- three independent chains, each advancing left to right -->
+    <path d="M8 14h30" />
+    <path d="M8 32h30" />
+    <path d="M8 50h30" />
+    <!-- the join: long shallow sweeps, so the outer streams visibly TRAVEL into
+         the shared tail instead of turning a corner at a common x (a tight
+         bracket reads as one glyph, not as three chains meeting) -->
+    <path d="M38 14C54 14 56 32 70 32" />
+    <path d="M38 32h32" />
+    <path d="M38 50C54 50 56 32 70 32" />
+  </g>
+  <g color="#7d8590" fill="currentColor">
+    <!-- seq-numbered entries along each writer's chain -->
+    <circle cx="8"  cy="14" r="4.5" /><circle cx="23" cy="14" r="4.5" /><circle cx="38" cy="14" r="4.5" />
+    <circle cx="8"  cy="32" r="4.5" /><circle cx="23" cy="32" r="4.5" /><circle cx="38" cy="32" r="4.5" />
+    <circle cx="8"  cy="50" r="4.5" /><circle cx="23" cy="50" r="4.5" /><circle cx="38" cy="50" r="4.5" />
+    <!-- the converged head, larger: what every peer agrees has arrived -->
+    <circle cx="82" cy="32" r="7" />
+  </g>
+</svg>
