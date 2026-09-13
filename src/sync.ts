@@ -285,14 +285,24 @@ export class SyncEngine {
     return { ...(this.rejects.get(topic) ?? {}) };
   }
 
-  // P24 — drain-and-reset: each stats() read returns the counters accumulated
-  // since the previous read, plus the bounded (topic, peer) byte leaderboard.
-  drainIntervalStats(): {
+  // P24 interval counters, read WITHOUT resetting (proposals-v3.8 P31).
+  //
+  // P24 made its only reader drain-and-reset, which silently made the NUMBER OF
+  // CALLERS part of the semantics: with N independent readers each one saw only
+  // the slice accumulated since whichever reader happened to run last, so values
+  // shrank as unrelated call frequency rose and nothing anywhere reported it.
+  // Reading and resetting are now separate: stats() uses this one and is a pure
+  // read safe for any number of callers at any cadence, while a host that wants
+  // strictly disjoint windows calls drainIntervalStats() from a single owner.
+  readIntervalStats(): {
     topics: Map<Topic, TopicSyncCounters>;
     hotspots: { topic: Topic; peerId: string; bytes: number }[];
   } {
-    const topics = new Map(this.interval);
-    this.interval.clear();
+    // Copy each counter object: `new Map(this.interval)` would share the live
+    // objects, so a "snapshot" would keep mutating under its reader — the same
+    // class of defect as the destructive read, just quieter.
+    const topics = new Map<Topic, TopicSyncCounters>();
+    for (const [t, c] of this.interval) topics.set(t, { ...c });
     const hotspots = [...this.intervalPairBytes]
       .map(([k, bytes]) => {
         const i = k.indexOf("\u0000");
@@ -300,8 +310,21 @@ export class SyncEngine {
       })
       .sort((a, b) => b.bytes - a.bytes || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : a.peerId < b.peerId ? -1 : 1))
       .slice(0, SYNC_HOTSPOT_TOP_N);
-    this.intervalPairBytes.clear();
     return { topics, hotspots };
+  }
+
+  // Explicit reset of the P24 interval window (proposals-v3.8 P31): same shape as
+  // readIntervalStats(), then clear. A single owning reader still gets exactly
+  // disjoint windows — the P24 behavior, now opt-in rather than riding on every
+  // stats() call.
+  drainIntervalStats(): {
+    topics: Map<Topic, TopicSyncCounters>;
+    hotspots: { topic: Topic; peerId: string; bytes: number }[];
+  } {
+    const out = this.readIntervalStats();
+    this.interval.clear();
+    this.intervalPairBytes.clear();
+    return out;
   }
 
   private counters(topic: Topic): TopicSyncCounters {
@@ -347,7 +370,10 @@ export class SyncEngine {
     this.hotWindowBytes += bytes;
     if (!this.hotEmitted && this.hotWindowBytes >= this.o.constants.SYNC_HOT_BYTES) {
       this.hotEmitted = true;
-      this.o.emitAnomaly({ kind: "sync_hot" });
+      // P32: name the (topic, peer) pair that crossed the threshold — the same
+      // identifiers syncHotspots reports, so the anomaly is actionable without
+      // a correlating stats() read at a different instant.
+      this.o.emitAnomaly({ kind: "sync_hot", topic, peerId });
     }
   }
 
@@ -887,7 +913,14 @@ export class SyncEngine {
               if (before !== undefined && before >= head.contigSeq) {
                 if (!ps.stalled.has(skey)) {
                   ps.stalled.add(skey);
-                  this.o.emitAnomaly({ kind: "sync_stalled" });
+                  // P32: a stall is per-(peer, stream), so name all three —
+                  // without them a host knows only THAT something stalled.
+                  this.o.emitAnomaly({
+                    kind: "sync_stalled",
+                    topic: m.topic,
+                    peerId: ps.session.peerId,
+                    writer: m.writer,
+                  });
                 }
               } else {
                 ps.stalled.delete(skey);

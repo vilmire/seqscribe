@@ -107,7 +107,7 @@ describe("beacon re-arm after stop (P28)", () => {
     const armed = puts();
     expect(armed).toBeGreaterThan(1); // the debounced push landed
 
-    // the ADHDev reconnect pattern: detach → re-attach on the same hub
+    // the host reconnect pattern: detach → re-attach on the same hub
     h1.stop();
     await sched.run({ untilMs: 11_000 });
     const afterStop = puts();
@@ -382,5 +382,102 @@ describe("beacon hints (§5.7 pre-write warning, P27)", () => {
     await sched.run({ untilMs: 200 });
     expect(board.get("wA")!.vectors).toBeDefined(); // the report still went out
     await a.close();
+  });
+});
+
+// proposals-v3.8 P30 — BeaconHandle exposed only stop(), so a host could not ask
+// the beacon to publish now. That absence is what produced P28's stop()/start()
+// re-arm pattern; and a host that published its own report could not reach the
+// library's private buildHints(), so its reports silently carried no §5.7a hints.
+describe("host-initiated push (P30)", () => {
+  it("pushNow() publishes immediately, without waiting for the debounce", async () => {
+    const sched = new Scheduler(0);
+    const { transport, puts } = memoryBeacon();
+    const a = makeNode(sched, "wA");
+
+    const h = a.beacon(transport);
+    await sched.run({ untilMs: 100 });
+    expect(puts()).toBe(1); // start()'s initial report
+
+    // an append alone would not publish until BEACON_DEBOUNCE_MS elapsed
+    void a.log(T).append("note", { i: 0 });
+    await sched.run({ untilMs: 200 });
+    expect(puts()).toBe(1); // still debouncing — this is the gap P30 closes
+
+    await h.pushNow();
+    expect(puts()).toBe(2); // published without advancing the clock
+
+    h.stop();
+    await a.close();
+  });
+
+  it("pushNow() carries the same hints the debounced push would", async () => {
+    const sched = new Scheduler(0);
+    const { transport, board } = memoryBeacon();
+    const node = createSeqscribe({
+      writerId: "wA",
+      storage: memoryHandle(),
+      clock: sched.clock(),
+      timers: sched.timers(),
+    });
+    // hintKeys is the per-topic opt-in gate buildHints() reads (§5.7a, P27)
+    const REG: TopicPolicy = {
+      kind: "register",
+      retention: { mode: "full" },
+      replication: "full-sync",
+      access: "content",
+      hintKeys: "plain",
+    };
+    node.defineTopic("t.cfg", REG);
+
+    const h = node.beacon(transport);
+    // the commit needs the scheduler to drive the virtual clock, so enqueue and
+    // then run rather than awaiting first
+    void node.register("t.cfg").set("theme", "dark");
+    // let the debounced push produce the library's own hint set
+    await sched.run({ untilMs: 30_000 });
+    const debounced = board.get("wA")!;
+    expect(debounced.hints).toBeDefined();
+    expect(debounced.hints!["t.cfg"]!.theme).toBeDefined();
+
+    // the whole point: a host-initiated publish is indistinguishable — before
+    // P30 a host building its own report had no way to produce this field, so
+    // publishing would have ERASED its hints from the board.
+    board.delete("wA");
+    await h.pushNow();
+    const manual = board.get("wA")!;
+    expect(manual.hints).toEqual(debounced.hints);
+    expect(manual.vectors).toEqual(debounced.vectors);
+
+    h.stop();
+    await node.close();
+  });
+
+  it("pushNow() is a no-op after stop(), after a re-arm, and after close()", async () => {
+    const sched = new Scheduler(0);
+    const { transport, puts } = memoryBeacon();
+    const a = makeNode(sched, "wA");
+
+    const h1 = a.beacon(transport);
+    await sched.run({ untilMs: 100 });
+    h1.stop();
+    const afterStop = puts();
+    await h1.pushNow(); // resolves, publishes nothing
+    expect(puts()).toBe(afterStop);
+
+    // a stale handle must not publish on a LATER arming's behalf — the same
+    // generation discipline stop() uses
+    const h2 = a.beacon(transport);
+    await sched.run({ untilMs: 200 });
+    const afterRearm = puts();
+    await h1.pushNow();
+    expect(puts()).toBe(afterRearm);
+    await h2.pushNow();
+    expect(puts()).toBe(afterRearm + 1);
+
+    await a.close();
+    const afterClose = puts();
+    await h2.pushNow(); // node-level teardown is terminal
+    expect(puts()).toBe(afterClose);
   });
 });

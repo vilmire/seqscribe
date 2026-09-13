@@ -255,7 +255,7 @@ export class LogCore {
     const t = this.recoveries.get(`${topic} ${writer}`);
     if (t && !t.unavailableReported) {
       t.unavailableReported = true;
-      this.emitAnomaly({ kind: "canonical_unavailable" });
+      this.emitAnomaly({ kind: "canonical_unavailable", topic, writer });
     }
   }
 
@@ -475,7 +475,7 @@ export class LogCore {
     if (head.sealReason === null) {
       head.sealReason = "fork";
       this.saveHead(head);
-      anomalies.push({ kind: "writer_forked" });
+      anomalies.push({ kind: "writer_forked", topic: item.topic, writer: item.writer });
     }
     settle.push(() => item.resolve());
   }
@@ -516,7 +516,7 @@ export class LogCore {
         head.contigChain = cutChain;
         if (head.sealReason === null) {
           head.sealReason = "fork";
-          anomalies.push({ kind: "writer_forked" });
+          anomalies.push({ kind: "writer_forked", topic: cert.topic, writer: w.writer });
         }
         this.saveHead(head);
         continue;
@@ -531,7 +531,7 @@ export class LogCore {
           if (head.sealReason === null) {
             head.sealReason = "fork";
             this.saveHead(head);
-            anomalies.push({ kind: "writer_forked" });
+            anomalies.push({ kind: "writer_forked", topic: cert.topic, writer: w.writer });
           }
         }
       }

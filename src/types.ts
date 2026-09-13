@@ -250,6 +250,14 @@ export interface BeaconTransport {
 }
 export interface BeaconHandle {
   stop(): void;
+  // Publish immediately, bypassing the BEACON_DEBOUNCE_MS debounce
+  // (proposals-v3.8 P30). The report is built through the same path as the
+  // debounced push — identical vectors() snapshot and identical hints
+  // derivation honoring each topic's hintKeys — so a host-initiated publish is
+  // indistinguishable from a library-initiated one. Advisory: never rejects
+  // (the round is best-effort, §5.7). A no-op after this handle's stop(), a
+  // re-arm, or node close.
+  pushNow(): Promise<void>;
 }
 export interface BeaconReport {
   node: string;
@@ -319,6 +327,19 @@ export interface Anomaly {
     | "sync_stalled" // extension (proposals-v3.5 P22): WANT rounds toward a peer stopped progressing
     | "sync_hot"; // extension (proposals-v3.5 P24): sync moved ≥ SYNC_HOT_BYTES within one SYNC_HOT_WINDOW_MS — informational, never a throttle
   entry?: LogEntry;
+  // Identifiers for the subject of the anomaly (proposals-v3.8 P32). All
+  // optional and all kind-dependent: an implementation that omits them stays
+  // conformant, and no existing handler breaks. Without these, a host receiving
+  // `sync_stalled` learns only THAT a stream stalled and has to correlate
+  // against stats() to find out which — sampled at a different instant than the
+  // anomaly. These carry no entry content: every field here is an identifier
+  // already exposed through stats(). `entry` remains the only field carrying
+  // user/agent payload, and the §14 advice not to log it is unchanged.
+  topic?: Topic;
+  peerId?: string; // sync_stalled, sync_hot
+  writer?: WriterId; // sync_stalled, writer_forked, entry_quarantined
+  view?: string; // view_faulted, delta_mismatch
+  consumer?: string; // consumer_abandoned
 }
 
 export interface SeqscribeNode {

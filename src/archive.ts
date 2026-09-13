@@ -65,7 +65,9 @@ export class ArchiveHub {
       const updatedAt = Date.parse(c.updatedAt);
       if (Number.isFinite(updatedAt) && updatedAt < staleBefore) {
         this.deps.store.cursorDelete(c.consumer, topic);
-        this.deps.emitAnomaly({ kind: "consumer_abandoned" });
+        // P32: name the consumer whose cursor was dropped and its topic — a
+        // host GC'ing generation-suffixed consumers needs to know which one.
+        this.deps.emitAnomaly({ kind: "consumer_abandoned", topic, consumer: c.consumer });
         continue; // resume resets to the first post-cut rowid (cursor row gone)
       }
       minCursor = Math.min(minCursor, c.lastRowid);

@@ -194,7 +194,11 @@ describe("view materialization", () => {
     const h = node.view("bad", T, bad);
     void node.log(T).append("note", {});
     await sched.run();
-    expect(anomalies.some((a) => a.kind === "view_faulted")).toBe(true);
+    // P32: the anomaly names WHICH view faulted and on which topic — without
+    // these a host with several views learns only that one of them broke.
+    const faulted = anomalies.filter((a) => a.kind === "view_faulted");
+    expect(faulted.length).toBeGreaterThanOrEqual(1);
+    expect(faulted[0]).toMatchObject({ kind: "view_faulted", topic: T, view: "bad" });
     expect(() => h.query("SELECT 1")).toThrowError(SeqscribeError);
   });
 

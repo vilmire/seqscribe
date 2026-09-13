@@ -572,7 +572,15 @@ export class RegisterHub {
       }
       case "chown-takeover": {
         if (!(await this.verifyTakeover(e))) {
-          if (mode === "live") this.deps.emitAnomaly({ kind: "takeover_invalid", entry: e });
+          // P32: topic/writer alongside `entry` so a host can log the subject
+          // without reaching into the entry (whose payload is user content).
+          if (mode === "live")
+            this.deps.emitAnomaly({
+              kind: "takeover_invalid",
+              entry: e,
+              topic: e.topic,
+              writer: e.writer,
+            });
           return;
         }
         ks.owner = String(payload.newOwner ?? "");
@@ -733,7 +741,12 @@ export class RegisterHub {
       "owned_violation",
       new Date(this.deps.clock()).toISOString(),
     );
-    this.deps.emitAnomaly({ kind: "owned_violation", entry: e });
+    this.deps.emitAnomaly({
+      kind: "owned_violation",
+      entry: e,
+      topic: e.topic,
+      writer: e.writer,
+    });
   }
 
   private markApproved(ks: KeyState, ref: EntryId, approver: EntryId): void {

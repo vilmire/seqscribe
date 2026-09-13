@@ -451,7 +451,7 @@ export class ViewHub {
     const expected = sha256HexUtf8(jcs(this.sortedRows(inst) as unknown as JsonValue));
     const actual = sha256HexUtf8(jcs(this.tableRows(inst) as unknown as JsonValue));
     if (expected !== actual) {
-      this.deps.emitAnomaly({ kind: "delta_mismatch" });
+      this.deps.emitAnomaly({ kind: "delta_mismatch", topic: inst.topic, view: inst.name });
       this.rewriteTable(inst);
       inst.epoch = this.mintEpoch();
       this.emitChange(inst, { upserts: [], deletes: [], reset: true });
@@ -568,7 +568,7 @@ export class ViewHub {
 
   private fault(inst: Instance, err: unknown): void {
     inst.faulted = true;
-    this.deps.emitAnomaly({ kind: "view_faulted" });
+    this.deps.emitAnomaly({ kind: "view_faulted", topic: inst.topic, view: inst.name });
     void err;
   }
 

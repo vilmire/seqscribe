@@ -64,7 +64,7 @@ export class BeaconHub {
     const gen = ++this.armGen;
     this.transport = t;
     this.hostHints = o?.hints ?? null;
-    this.push(); // initial report; GET piggybacks on each push
+    void this.push(); // initial report; GET piggybacks on each push
     return {
       stop: () => {
         if (this.armGen !== gen) return; // stale handle — a later arming owns the hub
@@ -76,6 +76,13 @@ export class BeaconHub {
         this.transport = null;
         this.hostHints = null;
       },
+      // P30: publish immediately, bypassing the debounce. A stale handle (one
+      // whose arming was retired by stop() or a re-arm) resolves without
+      // publishing rather than pushing on a later arming's behalf — the same
+      // generation discipline stop() uses. Advisory on failure like the
+      // debounced push: push() already swallows and the round is best-effort,
+      // so this never rejects.
+      pushNow: () => (this.armGen !== gen ? Promise.resolve() : this.push()),
     };
   }
 
@@ -98,7 +105,7 @@ export class BeaconHub {
     if (!this.transport || this.closed || this.debounceTimer !== null) return;
     this.debounceTimer = this.deps.timers.setTimeout(() => {
       this.debounceTimer = null;
-      this.push();
+      void this.push();
     }, this.deps.constants.BEACON_DEBOUNCE_MS);
   }
 
@@ -194,9 +201,17 @@ export class BeaconHub {
     return Object.keys(out).length > 0 ? out : undefined;
   }
 
-  private push(): void {
+  // One report-building path, shared by the debounced push and the host's
+  // pushNow() (proposals-v3.8 P30). Returning the promise is what lets pushNow
+  // await the round; the debounced caller discards it. A host-initiated publish
+  // is therefore byte-indistinguishable from a library-initiated one — same
+  // vectors() snapshot, same buildHints() derivation, same hintKeys policy —
+  // which is the whole point: before this, a host that wanted an immediate
+  // publish had to build the report itself and could not reach buildHints(),
+  // so its reports silently carried no §5.7a hints at all.
+  private push(): Promise<void> {
     const t = this.transport;
-    if (!t || this.closed) return;
+    if (!t || this.closed) return Promise.resolve();
     const gen = this.armGen;
     const report: BeaconReport = {
       node: this.deps.writerId,
@@ -205,7 +220,7 @@ export class BeaconHub {
     };
     const hints = this.buildHints();
     if (hints) report.hints = hints;
-    void t
+    return t
       .put(report)
       .then(() => t.get())
       .then((reports) => {

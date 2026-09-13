@@ -109,13 +109,13 @@ export class FinalityHub {
     if (!this.deps.topics.has(cert.topic)) return "bad";
     const policy = this.deps.topics.get(cert.topic).policy;
     if (policy.finalityAuthority === undefined || cert.authority !== policy.finalityAuthority) {
-      this.deps.emitAnomaly({ kind: "bad_cert" });
+      this.deps.emitAnomaly({ kind: "bad_cert", topic: cert.topic });
       return "bad";
     }
     const verify = this.deps.authority?.verifyFinality;
     if (!verify) return "bad";
     if (!(await verify(cert))) {
-      this.deps.emitAnomaly({ kind: "bad_cert" });
+      this.deps.emitAnomaly({ kind: "bad_cert", topic: cert.topic });
       return "bad";
     }
     const existing = this.deps.core.getCert(cert.topic);
@@ -125,11 +125,11 @@ export class FinalityHub {
         if (jcs(cert as unknown as JsonValue) === jcs(existing as unknown as JsonValue))
           return "duplicate";
         // generation reuse with different content (§7.2)
-        this.deps.emitAnomaly({ kind: "bad_cert" });
+        this.deps.emitAnomaly({ kind: "bad_cert", topic: cert.topic });
         return "bad";
       }
       if (orderCompare(cert.order, existing.order) < 0) {
-        this.deps.emitAnomaly({ kind: "bad_cert" }); // watermark went backwards
+        this.deps.emitAnomaly({ kind: "bad_cert", topic: cert.topic }); // watermark went backwards
         return "bad";
       }
     }

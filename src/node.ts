@@ -104,7 +104,17 @@ export interface NodeStats {
 }
 
 export interface SeqscribeNodeExt extends SeqscribeNode {
+  // A PURE read (proposals-v3.8 P31): safe to call from any number of places at
+  // any cadence. The P24 interval counters under `topics[].sync` and
+  // `syncHotspots` accumulate since the last drainSyncInterval() — they are NOT
+  // reset by reading them here.
   stats(): NodeStats;
+  // Reset the P24 interval window and return what it held (proposals-v3.8 P31).
+  // Call this from exactly ONE owner if you want strictly disjoint windows; every
+  // other consumer should read stats(). This is the behavior P24 attached to
+  // stats() itself, now opt-in: leaving it uncalled simply makes the interval
+  // counters cumulative-since-start, which no reader can corrupt for another.
+  drainSyncInterval(): { topics: Record<Topic, TopicSyncCounters>; syncHotspots: NodeStats["syncHotspots"] };
   // Durable-consumer lifecycle (proposals-v3.5 P17–P19) — reset/delete/prune
   // are inactive-consumer operations; caughtUp needs the consumer registered.
   resetConsumer(
@@ -291,6 +301,14 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
           // "Promise-returning APIs reject"). The single surviving synchronous
           // throw is §11.1's raw append on a register topic ("throws" is
           // normative there): a static API-misuse, not a runtime condition.
+          //
+          // CALLER HAZARD (proposals-v3.8 P33): because this one case throws
+          // synchronously, a caller that bounds concurrency MUST take its slot
+          // AFTER append returns a promise, never before. A slot reserved first
+          // is never released — neither settle handler attaches — so repeated
+          // misuse walks the counter to its cap and parks it there, and the
+          // caller then sheds every record for the life of the process while the
+          // topic is perfectly healthy: a silent, permanent, fail-closed drop.
           if (topics.has(topic) && topics.get(topic).policy.kind === "register")
             throw misuse(`raw append on register topic ${topic} — use register(topic) helpers`);
           return core.append(topic, kind, payload, o?.ref ? { ref: o.ref } : undefined);
@@ -419,9 +437,12 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
   };
 
   const stats = (): NodeStats => {
-    // P24 — one drain per stats() call: the interval counters cover
-    // [previous stats() read, this one] and reset atomically here
-    const interval = sync.drainIntervalStats();
+    // P31 — stats() is a PURE READ. P24 originally drained here, which made the
+    // number of callers part of the semantics (N readers each saw only the slice
+    // since whichever ran last, with no error and no zero to reveal it). The
+    // interval counters now accumulate until a host explicitly calls
+    // drainSyncInterval(), so any number of readers at any cadence is safe.
+    const interval = sync.readIntervalStats();
     const out: NodeStats = { topics: {}, peers: sync.peerStats(), syncHotspots: interval.hotspots };
     const now = clock();
     for (const topic of topics.list()) {
@@ -462,6 +483,14 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
   // SPEC-shaped SeqscribeNode, whose attach names the base PeerHandle.
   return Object.assign(node, {
     stats,
+    // P31: the explicit drain. Returns the window it cleared in the same shape
+    // stats() reports, so a single-owner collector can publish it unchanged.
+    drainSyncInterval: () => {
+      const i = sync.drainIntervalStats();
+      const topics: Record<Topic, TopicSyncCounters> = {};
+      for (const [t, c] of i.topics) topics[t] = c;
+      return { topics, syncHotspots: i.hotspots };
+    },
     resetConsumer: (topic: Topic, consumer: string, o?: { from?: "earliest-retained" | "head" }) =>
       consumers.resetConsumer(topic, consumer, o),
     deleteConsumer: (topic: Topic, consumer: string) => consumers.deleteConsumer(topic, consumer),

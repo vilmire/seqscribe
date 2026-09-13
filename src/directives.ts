@@ -62,7 +62,7 @@ export class DirectiveHub {
     try {
       this.validateShape(d);
       if (!(await this.verify(d))) {
-        this.deps.emitAnomaly({ kind: "bad_directive" });
+        this.deps.emitAnomaly({ kind: "bad_directive", topic: d.topic, writer: d.writer });
         return;
       }
       const result = await this.deps.core.applyDirective(d);

@@ -123,7 +123,13 @@ describe("P22 — finality-branch WANT non-progress detection (incident regressi
     expect(counted.types()["WANT"] ?? 0).toBeLessThanOrEqual(6);
 
     // the stall is visible: anomaly, per-peer stalled count, reject counters
-    expect(a.anomalies.filter((x) => x.kind === "sync_stalled").length).toBe(1);
+    const stalls = a.anomalies.filter((x) => x.kind === "sync_stalled");
+    expect(stalls.length).toBe(1);
+    // P32: the anomaly names its subject, so a host can alert on it directly
+    // instead of correlating against a stats() read at a different instant.
+    expect(stalls[0]).toMatchObject({ kind: "sync_stalled", topic: T, peerId: "wB", writer: "wB" });
+    // and it carries no entry content — identifiers only
+    expect(stalls[0]!.entry).toBeUndefined();
     const stats = a.node.stats();
     expect(stats.peers.find((p) => p.peerId === "wB")!.stalledStreams).toBe(1);
     expect(stats.topics[T]!.applyRejects["rejected_finality"]).toBeGreaterThanOrEqual(5);
@@ -186,10 +192,32 @@ describe("P24 — interval sync throughput in stats()", () => {
     expect(a.anomalies.filter((x) => x.kind === "sync_hot")).toEqual([]);
     expect(b.anomalies.filter((x) => x.kind === "sync_hot")).toEqual([]);
 
-    // interval semantics: the read above consumed the interval — a second
-    // read with no traffic in between is all zeros and hotspot-free
+    // P31: stats() is a PURE read — re-reading with no traffic in between
+    // returns the SAME numbers, not zeros. Under P24's drain-on-read this
+    // second read would have been all-zero, which is precisely why a second
+    // independent caller silently stole the first one's interval.
     const sa2 = a.node.stats();
-    expect(sa2.topics[T]!.sync).toEqual({
+    expect(sa2.topics[T]!.sync).toEqual(sa.topics[T]!.sync);
+    expect(sa2.syncHotspots).toEqual(sa.syncHotspots);
+
+    // P31: and the snapshot handed out is a copy — later traffic must not
+    // mutate an already-returned object under its reader.
+    const appliedAtFirstRead = sa.topics[T]!.sync.appliedEntries;
+    for (let i = 0; i < 5; i++) void b.node.log(T).append("more", { i });
+    await sched.run({ untilMs: sched.now() + 3_000 });
+    expect(sa.topics[T]!.sync.appliedEntries).toBe(appliedAtFirstRead);
+
+    // counters are cumulative until someone drains: the new traffic adds on top
+    const sa3 = a.node.stats();
+    expect(sa3.topics[T]!.sync.appliedEntries).toBeGreaterThanOrEqual(appliedAtFirstRead + 5);
+
+    // P31: the explicit drain returns the window and resets it — the P24
+    // behavior, now opt-in for a single owning reader.
+    const drained = a.node.drainSyncInterval();
+    expect(drained.topics[T]!.appliedEntries).toBe(sa3.topics[T]!.sync.appliedEntries);
+    expect(drained.syncHotspots[0]).toMatchObject({ topic: T, peerId: "wB" });
+    const afterDrain = a.node.stats();
+    expect(afterDrain.topics[T]!.sync).toEqual({
       servedEntries: 0,
       servedBytes: 0,
       appliedEntries: 0,
@@ -197,13 +225,35 @@ describe("P24 — interval sync throughput in stats()", () => {
       wantRoundsRequested: 0,
       wantRoundsServed: 0,
     });
-    expect(sa2.syncHotspots).toEqual([]);
+    expect(afterDrain.syncHotspots).toEqual([]);
 
-    // and a fresh interval accumulates again
-    for (let i = 0; i < 5; i++) void b.node.log(T).append("more", { i });
-    await sched.run({ untilMs: sched.now() + 3_000 });
-    const sa3 = a.node.stats();
-    expect(sa3.topics[T]!.sync.appliedEntries).toBeGreaterThanOrEqual(5);
+    await Promise.all([a.node.close(), b.node.close()]);
+  });
+
+  // P31 regression: the defect this proposal exists for. Two independent
+  // readers must each see the whole interval — under P24's drain-on-read the
+  // second reader got zeros and neither could tell.
+  it("P31 — multiple stats() readers do not steal each other's interval", async () => {
+    const sched = new Scheduler(1_000_000);
+    const rng = new SeededRng(77);
+    const a = makeNode(sched, "wA", (c) => c.sig === "valid-sig");
+    const b = makeNode(sched, "wB", (c) => c.sig === "valid-sig");
+    for (let i = 0; i < 40; i++) void b.node.log(T).append("e", { i });
+    await sched.run({ untilMs: sched.now() + 1_000 });
+
+    const link = new VirtualLink(sched, rng);
+    a.node.attach(link.a, { peerId: "wB", peerClass: "content", grants: { [T]: "full" } });
+    b.node.attach(link.b, { peerId: "wA", peerClass: "content", grants: { [T]: "full" } });
+    await sched.run({ untilMs: sched.now() + 5_000 });
+
+    // three independent "consumers", as a host with a status reporter, a
+    // metadata RPC and a readiness probe would have
+    const r1 = a.node.stats().topics[T]!.sync.appliedEntries;
+    const r2 = a.node.stats().topics[T]!.sync.appliedEntries;
+    const r3 = a.node.stats().topics[T]!.sync.appliedEntries;
+    expect(r1).toBeGreaterThanOrEqual(40);
+    expect(r2).toBe(r1);
+    expect(r3).toBe(r1);
 
     await Promise.all([a.node.close(), b.node.close()]);
   });

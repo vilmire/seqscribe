@@ -1,6 +1,6 @@
 # SPEC amendments — v3.8 candidates (P30–P34)
 
-> Status: **PROPOSED, none implemented.** Nothing here is in SPEC.md or CHANGELOG.md yet. Per the standing convention, SPEC is frozen between stamps and amendments accumulate here first.
+> Status: **P30–P33 IMPLEMENTED (2026-09-13), none ratified. P34 remains PROPOSED only.** Nothing here is in SPEC.md or CHANGELOG.md yet; the per-item "Status" markers below record what was actually built, including where it diverged from the proposal. Per the standing convention, SPEC is frozen between stamps and amendments accumulate here first.
 >
 > Discovery path for this cycle: **reading the embedder's integration layer instead of waiting for it to report.** Every previous cycle arrived as a report — a failing run (v3.4), an incident or a blocked phase (v3.5/v3.6), a README that could not be written (v3.7). This one came from reading the ~11,400 lines of host glue in the production integration's `seqscribe/` directory and asking a different question: *where is the host paying a standing cost the library could absorb?* That cost is visible in the glue's own comments, which document each workaround and why it was necessary. None of the five below was ever filed as a request — the host worked around them and moved on, which is exactly why they persisted.
 >
@@ -39,6 +39,8 @@ interface BeaconHandle {
 
 Implementation is small: the debounced path's body already exists; `pushNow` is that body minus the timer, and `buildHints()` stays private because nothing outside needs to call it directly once the report is built internally. No wire change — `BeaconReport` is unchanged, and no hashed input moves.
 
+**Status: implemented 2026-09-13** — `BeaconHandle.pushNow(): Promise<void>`. `BeaconHub.push()` was refactored to *return* its promise (it was `void`-returning fire-and-forget); `pushNow` is that same method, so report construction — `vectors()` snapshot, `buildHints()` derivation, `hintKeys` policy — is one code path shared with the debounced push, which is the property the proposal actually needed. `buildHints()` stays private: nothing outside needs to call it once the report is built internally. A stale handle (retired by `stop()` or a later re-arm) resolves without publishing, reusing the same `armGen` discipline `stop()` already had; after `close()` it is likewise a no-op. Never rejects — `push()` already swallows, matching §5.7's best-effort contract. Regression: `test/beacon.test.ts` "host-initiated push (P30)" — publish-without-advancing-the-clock while a debounce is still pending, **hints and vectors byte-equal to the debounced push's** (the half that makes the hint-preservation hack unnecessary), and no-op after stop / re-arm / close.
+
 **Field evidence.** The integration ships a 904-line beacon wrapper whose `doPut`/`doGet`/`pushNow` re-implement the transport round trip specifically to get a host-initiated publish. Its comments name both halves: "Push a report NOW, outside the library's debounce" and "P27 hint derivation is private to the library, so preserve its last projected hint set rather than clearing it on the server during reconnect re-seeding." Not all 904 lines are library-replaceable (projection, split-retry and the content boundary are genuinely host concerns), but the push path is, and the hint-preservation hack exists **only** because of the private method.
 
 ---
@@ -58,6 +60,8 @@ P24 chose read-and-reset deliberately ("reset on every `stats()` read exactly as
 3. **Minimum viable**: keep the behavior, state it normatively in §14.1 as "destructive — exactly one caller", and emit `ERR_MISUSE`… which is not detectable, so in practice this is documentation only. Listed for completeness; (1) is the real fix.
 
 (1) changes no field shape and is additive apart from `stats()` ceasing to clear — which can only *widen* what a correct single-reader host observes.
+
+**Status: implemented 2026-09-13 — remedy (1), the surface split.** `stats()` is now a **pure read**: `SyncEngine.readIntervalStats()` returns the counters without clearing, and the new `SeqscribeNodeExt.drainSyncInterval()` returns-and-resets for a single owning reader that wants strictly disjoint windows. Leaving the drain uncalled simply makes the interval counters cumulative-since-start, which no reader can corrupt for another. One defect found while implementing, beyond what the proposal described: the original `new Map(this.interval)` shared the live counter *objects*, so a returned "snapshot" kept mutating under its holder — the same class of defect as the destructive read, just quieter. `readIntervalStats()` copies each counter. **This is a behavior change to a shipped API**: a host that relied on `stats()` draining now sees cumulative values, which is why it is recorded here rather than slipped in — the fix direction is strictly safer (a single-reader host sees *more* than before, never less), but it is not byte-compatible. Regression: `test/sync-stall.test.ts` — the rewritten P24 block (re-read returns identical values rather than zeros; a returned snapshot is immune to later traffic; `drainSyncInterval()` resets and the next read is all-zero) plus a new **P31 case pinning the defect itself**: three independent `stats()` readers each see the whole interval.
 
 **Field evidence.** The integration added a 270-line collector whose stated purpose is to make `stats()` single-reader by construction: it ticks on its own cadence, is the only caller of `node.stats()` in the daemon, and publishes a pure-getter `snapshot()` everything else reads. Its header records the defect from production: three independent callers (a status reporter, a metadata RPC, a readiness probe) each stealing the others' accumulation. There is a dedicated regression test asserting the single-reader property, and a starred comment warning future contributors that calling `node.stats()` directly re-introduces the bug. That is a host building a library invariant the library does not enforce.
 
@@ -91,6 +95,8 @@ interface Anomaly {
 
 All optional, so no existing handler breaks and an implementation that omits them stays conformant. Content stays out by construction: these are identifiers already exposed through `stats()`, never payload. **`entry` remains the only field carrying user content**, and the §14 guidance that hosts should not log it is unchanged — if anything this makes compliance easier, since the identifiers a host actually wants to log are now available without reaching into `entry`.
 
+**Status: implemented 2026-09-13** — all five optional fields added, and **populated at every emit site that has the identifier in scope** (the fields are worthless if only declared): `sync_stalled` now carries topic + peerId + writer, `sync_hot` topic + peerId, `view_faulted`/`delta_mismatch` topic + view, `consumer_abandoned` topic + consumer, `bad_cert` topic, `bad_directive` topic + writer, `canonical_unavailable` topic + writer, `writer_forked` topic + writer at all four emit sites, `owned_violation`/`takeover_invalid` topic + writer alongside the `entry` they already carried. Purely additive and all-optional, so no existing handler breaks. No entry content is added anywhere — every new field is an identifier already exposed through `stats()`, and `entry` remains the only field carrying payload. Regression: `test/sync-stall.test.ts` asserts the `sync_stalled` subject on a real stall (and that it carries no `entry`); `test/views.test.ts` asserts the faulted view is named.
+
 **Field evidence.** The integration's anomaly handler documents the shortfall where it logs: "The `Anomaly` payload is `{ kind, entry? }` — the library carries no peer or topic detail on the sync signals, so the log line is the kind plus the node-level context we already hold." Its `sync_stalled` line ends by telling the reader to go look somewhere else (`check get_status_metadata seqscribe.stalledStreams / applyRejects`) — a log message whose content is an instruction to perform the lookup the library could have saved.
 
 ---
@@ -118,6 +124,8 @@ This is the same **shape** as v3.5's recurring finding: a guard stuck permanentl
 
 (1) is recommended. Note that **neither option is an in-flight/backpressure API** — the library has no append-side queue-depth signal at all (`SEND_QUEUE_CAP` bounds the *send* lane, not local appends), so every host doing load-shedding hand-rolls the counter. Whether the library should own that is worth asking, but it is a larger question than this item and is not proposed here.
 
+**Status: implemented 2026-09-13 — remedy (1), documentation.** The hazard is now stated at the throw site in `src/node.ts`: a caller bounding concurrency must take its slot *after* `append` returns a promise, never before, because a slot reserved first is never released and the counter parks at its cap — a silent, permanent, fail-closed drop on a healthy topic. Remedy (2) (removing the asymmetry) was **not** taken: it contradicts §11.1's normative "throws" and would reclassify a development-time error as a runtime one, which needs a deliberate §11.1 amendment rather than being folded into a host-surface cycle. The §14 amendment text still needs writing at ratification — this lands the in-source warning, which is what a reader of the code hits first. No behavior change, no test (nothing executable changed).
+
 **Field evidence.** The integration extracted a shared `inflight-gate.ts` after **two** legs hand-rolled the same accounting and grew the **same two defects**: a slot leaked on the surviving synchronous throw, and a negative count after a reconfigure zeroed the counter with appends still outstanding. Its header documents the first defect exactly as analyzed above, including that the result is a permanent fail-closed drop on a healthy topic. Two independent implementations of the same small counter (now 123 lines once both defects were understood and the generation discipline added) converging on the same two bugs is the signal that the hazard is in the library's shape, not in one author's care.
 
 ---
@@ -136,6 +144,8 @@ Worse, the honest answer requires knowing something only the host has: whether i
 
 This also explains why **P27's `keyStale` could ship inert for two revisions**: `staleness()` has no way to signal "this feature has no data source", because an absent `keyStale` is also the correct return when no peer is ahead. A surface that cannot distinguish *no data* from *no problem* will hide its own breakage, and did.
 
+**Status: NOT implemented** — deliberately. This is the one item here whose *shape* is uncertain rather than just its wording, and getting an aggregate wrong would bake a second host's arithmetic into the library. Deferred pending a second embedder.
+
 **Amendment** (lowest-confidence item here — the shape deserves a second embedder before ratification):
 
 - `staleness()` gains a documented derivation for the two beacon-certified questions, or an aggregate (`aheadPeers`, `soleCopyRisk: true | false | "unknown"`) that encodes the truncation rule so a host cannot get it subtly wrong.
@@ -150,12 +160,18 @@ This also explains why **P27's `keyStale` could ship inert for two revisions**: 
 
 | # | Gap | Host cost today | Fix size |
 |---|---|---|---|
-| **P30** | No `BeaconHandle.pushNow()`; `buildHints()` private | 904-line beacon wrapper; hints cached and replayed stale | **Small** — expose the existing push path |
-| **P31** | `stats()` destructive ⇒ caller count changes values | 270-line single-reader collector + dedicated regression test | **Small–medium** — split pure read from drain |
-| **P32** | `Anomaly` carries no topic/peer/view/consumer | Anomaly feed unalertable; log lines that say "go look elsewhere" | **Small** — optional fields |
-| **P33** | One synchronous throw in an otherwise-async `append` | Two legs, same two defects, extracted into a shared gate | **Trivial** (document) |
-| **P34** | `staleness()` has no reader for the features it feeds | Host-side diagnostics deriving rules the library never states | **Needs design** |
+| # | Gap | Status |
+|---|---|---|
+| **P30** | No `BeaconHandle.pushNow()`; `buildHints()` private | **Implemented** — `pushNow()` shares the debounced push's report path, hints included |
+| **P31** | `stats()` destructive ⇒ caller count changes values | **Implemented** (remedy 1) — `stats()` pure, `drainSyncInterval()` explicit. *Behavior change to a shipped API* |
+| **P32** | `Anomaly` carries no topic/peer/view/consumer | **Implemented** — five optional fields, populated at every emit site with the identifier in scope |
+| **P33** | One synchronous throw in an otherwise-async `append` | **Implemented** (remedy 1, documentation). §14 amendment text still to write at ratification |
+| **P34** | `staleness()` has no reader for the features it feeds | **Not implemented** — shape uncertain, deferred for a second embedder |
 
-Recommended order: **P30, P32, P33** are small, self-contained, and each removes a standing host workaround. **P31** is the highest-value correctness item (it is the only one currently producing *wrong numbers* rather than missing ones) but needs an API decision about `stats()` compatibility. **P34** should wait for a second embedder to confirm the shape.
+`npm run check` green across all of it: 275 tests (up from 271), strict `types.d.ts` pass, fixture consumability gate.
+
+**One compatibility note for ratification.** P31 is the only item that changes existing behavior rather than adding surface: a host that relied on `stats()` draining now reads cumulative counters. The direction is strictly safer (a correct single-reader host sees *more* than before, never less) and the old semantics remain available via `drainSyncInterval()`, but it is not byte-compatible and should be called out in the CHANGELOG entry rather than folded in silently.
+
+**Note on `types.d.ts`.** It is generated from SPEC.md's normative `ts` blocks, so it still shows the pre-P30 `BeaconHandle` and the pre-P32 `Anomaly` — correct, since SPEC is frozen until a stamp. The real shipped surface is `dist/index.d.ts`, generated from source, which carries all of it. Ratification closes the gap.
 
 Three of the five (P30, P31, P34) are in surfaces that v3.5/v3.6 had already amended — evidence that the amendment cycles were fixing the defect in front of them rather than the surface around it. P32 and P33 are both explicitly scoped-out decisions from P22 and P11 respectively, recorded here because the cost of the omission is now measurable.
