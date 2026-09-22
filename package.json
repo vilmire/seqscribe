@@ -37,6 +37,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
     "build:e2e": "npx esbuild e2e-browser/main.src.js --bundle --format=esm --platform=browser --outfile=e2e-browser/main.js '--external:/@sqlite.org/*' && npx esbuild e2e-browser/dashboard-worker.src.js --bundle --format=esm --platform=browser --outfile=e2e-browser/dashboard-worker.js '--external:/@sqlite.org/*' && npx esbuild e2e-browser/dashboard-main.src.js --bundle --format=esm --outfile=e2e-browser/dashboard-main.js",
     "test": "vitest run",
     "test:watch": "vitest",
