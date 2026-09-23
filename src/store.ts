@@ -190,6 +190,24 @@ export class Store {
       .map(rowToEntry);
   }
 
+  // SubHub's `tail` view on a `full`-retention topic (rowid order == insertion
+  // order == append order, same as the ring tail's push order): last `limit`
+  // rows, re-ascended to rowid order for the SNAP body. Two queries, not one
+  // ORDER BY rowid DESC LIMIT ? in a subquery, because sqlite's query planner
+  // does not reliably use the `sq_log` rowid ordering for a wrapped subquery
+  // ORDER BY without a matching index hint, and this method runs on every
+  // fresh/reset SUB — worth the second round trip to keep the plan obvious.
+  entriesTailByRowid(topic: Topic, limit: number): { entry: LogEntry; rowid: number }[] {
+    const rows = this.db
+      .all<RawLogRow>("SELECT rowid, * FROM sq_log WHERE topic = ? ORDER BY rowid DESC LIMIT ?", [
+        topic,
+        limit,
+      ])
+      .map(rowToEntry);
+    rows.reverse(); // DESC fetch, ASC delivery — oldest-first, same as ringTail()
+    return rows;
+  }
+
   // Total-order iteration (§1): entries strictly after `after` in
   // (hlc_l, hlc_c, writer, seq) order; after=null starts from the beginning.
   entriesAfterOrder(topic: Topic, after: Order | null, limit: number): LogEntry[] {
@@ -387,6 +405,39 @@ export class Store {
       fromSeq,
     ]);
     this.logCounts.delete(topic); // recount lazily
+  }
+
+  // Node.pruneTopic (local housekeeping GC — see log.ts processPruneTopic's
+  // doc comment). Deletes rows at or below `belowRowid` (all writers), and,
+  // when `hlcBefore` is given, additionally requires hlc_l < hlcBefore — the
+  // caller passes the tighter of the two bounds it already computed
+  // (keepNewest's rowid floor, olderThanMs's hlc_l floor) so this is always a
+  // single bounded DELETE, never an unbounded scan. Batched like
+  // archiveCovered: a topic's whole prunable region can be millions of rows
+  // (the same reason archiveCovered doesn't do it in one statement), and
+  // this runs inside the append queue's flush, which must not stall on one
+  // giant transaction. Returns rows actually deleted.
+  deleteLogRowsUpToRowid(topic: Topic, belowRowid: number, hlcBefore: number | null): number {
+    const BATCH = 2_000;
+    let total = 0;
+    for (;;) {
+      const cond = hlcBefore !== null ? "AND hlc_l < ?" : "";
+      const params: unknown[] = hlcBefore !== null
+        ? [topic, belowRowid, hlcBefore, BATCH]
+        : [topic, belowRowid, BATCH];
+      const rows = this.db.all<{ rowid: number }>(
+        `SELECT rowid FROM sq_log WHERE topic = ? AND rowid <= ? ${cond} ORDER BY rowid LIMIT ?`,
+        params,
+      );
+      if (rows.length === 0) break;
+      this.db.transaction(() => {
+        for (const r of rows) this.db.run("DELETE FROM sq_log WHERE rowid = ?", [r.rowid]);
+      });
+      total += rows.length;
+      if (rows.length < BATCH) break;
+    }
+    if (total > 0) this.logCounts.delete(topic); // recount lazily
+    return total;
   }
 
   checkpointPut(

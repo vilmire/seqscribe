@@ -99,6 +99,21 @@ interface RetireTopicItem {
   reject: (e: unknown) => void;
 }
 
+// Local entry prune (REQUESTED EDIT, host-guide `pruneTopic`). Preconditions
+// mirror RetireTopicItem's re-check discipline (checked at enqueue AND again
+// in the flush handler — a racing append in the same batch must not be
+// pruned out from under itself): full-sync/register topics refused, and the
+// deletable floor is capped by every registered consumer's cursor so a live
+// onEntry consumer never has its unread tail pruned out from under it.
+interface PruneTopicItem {
+  t: "pruneTopic";
+  topic: Topic;
+  olderThanMs: number | undefined;
+  keepNewest: number | undefined;
+  resolve: (r: { prunedRows: number }) => void;
+  reject: (e: unknown) => void;
+}
+
 type QueueItem =
   | AppendItem
   | ExternalItem
@@ -106,7 +121,8 @@ type QueueItem =
   | CertItem
   | DirectiveItem
   | AdoptCutItem
-  | RetireTopicItem;
+  | RetireTopicItem
+  | PruneTopicItem;
 
 export interface RecoveryTarget {
   finalSeq: Seq;
@@ -307,6 +323,57 @@ export class LogCore {
     });
   }
 
+  // Local entry prune (host-guide `pruneTopic`, REQUESTED EDIT). Unlike
+  // retireTopic (whole-writer-row GC, only ever fires on an EMPTY topic),
+  // this shrinks a LIVE `full`-retention topic's durable sq_log row count —
+  // the primitive `writer-gc.ts`-shaped hosts need for a topic that
+  // accumulates unboundedly between finality certs (ArchiveHub requires a
+  // cert; this does not — it is local housekeeping, not a cross-peer
+  // finality claim, same distinction `retireTopic`'s own doc comment draws).
+  // `full-sync` is refused for the same reason retireTopic refuses it: those
+  // rows are cross-peer canonical, and deleting them locally would fork the
+  // mesh's view of "what this node has" without an authority's say-so.
+  // `register`-kind is refused because register state is reconstructed by
+  // replaying its topic from genesis (RegisterHub) — pruning would silently
+  // invalidate register replay for a NEW replica that later syncs from this
+  // node (the local prune has no on-wire signal, so a peer requesting entries
+  // below the prune floor would see a false gap, not a reasoned refusal).
+  pruneTopic(
+    topic: Topic,
+    o: { olderThanMs?: number; keepNewest?: number },
+  ): Promise<{ prunedRows: number }> {
+    if (this.closed) throw new SeqscribeError("ERR_MISUSE", "node is closed");
+    const entry = this.topics.get(topic); // ERR_UNKNOWN_TOPIC before enqueue
+    if (entry.policy.kind === "register") {
+      return Promise.reject(misuse(`pruneTopic: register-kind topics are not prunable (${topic})`));
+    }
+    if (entry.policy.replication === "full-sync") {
+      return Promise.reject(misuse(`pruneTopic: full-sync topics are not prunable (${topic})`));
+    }
+    if (entry.policy.retention.mode !== "full") {
+      // ring/none already self-bound (in-memory tail size / nothing durable)
+      // — pruneTopic exists to shrink a real sq_log row count, so a topic
+      // with none has nothing for it to do; refusing (not a silent 0-row
+      // no-op) matches retireTopic's "wrong topic shape" refusals below.
+      return Promise.reject(
+        misuse(`pruneTopic: requires retention "full" (${topic} is ${entry.policy.retention.mode})`),
+      );
+    }
+    if (o.olderThanMs === undefined && o.keepNewest === undefined) {
+      return Promise.reject(misuse(`pruneTopic: at least one of olderThanMs/keepNewest is required`));
+    }
+    return new Promise((resolve, reject) => {
+      this.push({
+        t: "pruneTopic",
+        topic,
+        olderThanMs: o.olderThanMs,
+        keepNewest: o.keepNewest,
+        resolve,
+        reject,
+      });
+    });
+  }
+
   recoveryTarget(topic: Topic, writer: WriterId): RecoveryTarget | undefined {
     return this.recoveries.get(`${topic} ${writer}`);
   }
@@ -412,6 +479,15 @@ export class LogCore {
     return [...(this.rings.get(topic) ?? [])];
   }
 
+  // SubHub's "tail" view on a full-retention topic (G2b) — the durable
+  // counterpart to ringTail: last `limit` sq_log rows for `topic`, oldest
+  // first. A pure store read (no in-memory tail to maintain — full topics
+  // already persist every row via persist()), so this has no undo/rollback
+  // entry in the ringUndo journal the way ring pushes need.
+  fullTail(topic: Topic, limit: number): LogEntry[] {
+    return this.store.entriesTailByRowid(topic, limit).map((r) => r.entry);
+  }
+
   entries(topic: Topic, writer: WriterId, fromSeq: Seq, toSeq: Seq): LogEntry[] {
     return this.store.entriesRange(topic, writer, fromSeq, toSeq).map((r) => r.entry);
   }
@@ -494,7 +570,8 @@ export class LogCore {
           else if (item.t === "cert") this.processCert(item, settle, anomalies);
           else if (item.t === "directive") this.processDirective(item, settle, anomalies);
           else if (item.t === "adopt") this.processAdopt(item, settle);
-          else this.processRetireTopic(item, settle);
+          else if (item.t === "retireTopic") this.processRetireTopic(item, settle);
+          else this.processPruneTopic(item, settle);
         }
         this.store.metaSet(HLC_META_KEY, JSON.stringify(this.hlcState));
       });
@@ -757,6 +834,93 @@ export class LogCore {
     if (this.vectorsCache) delete this.vectorsCache[topic];
 
     settle.push(() => item.resolve({ writersRemoved: writers.length }));
+  }
+
+  // Local entry prune (pruneTopic's flush-handler half — see pruneTopic's
+  // doc comment for the design rationale). Re-checks the topic-shape
+  // preconditions (kind/replication/retention) the same way
+  // processRetireTopic re-checks its own: a racing defineTopic can't happen
+  // (topics are immutable per process, §14) but re-reading here — instead of
+  // trusting pruneTopic()'s enqueue-time snapshot — costs nothing and keeps
+  // the two prune paths (enqueue preflight, flush re-check) symmetric with
+  // retireTopic's own discipline rather than a special case.
+  private processPruneTopic(item: PruneTopicItem, settle: (() => void)[]): void {
+    const { topic } = item;
+    const entry = this.topics.get(topic);
+    if (entry.policy.kind === "register") {
+      settle.push(() =>
+        item.reject(misuse(`pruneTopic: register-kind topics are not prunable (${topic})`)),
+      );
+      return;
+    }
+    if (entry.policy.replication === "full-sync") {
+      settle.push(() =>
+        item.reject(misuse(`pruneTopic: full-sync topics are not prunable (${topic})`)),
+      );
+      return;
+    }
+    if (entry.policy.retention.mode !== "full") {
+      settle.push(() =>
+        item.reject(
+          misuse(
+            `pruneTopic: requires retention "full" (${topic} is ${entry.policy.retention.mode})`,
+          ),
+        ),
+      );
+      return;
+    }
+
+    // Cursor floor: never delete a row a registered onEntry consumer has not
+    // yet read. Same source ArchiveHub.archiveNow reads
+    // (store.cursorsForTopic) — an inactive/abandoned cursor still gates
+    // here (unlike ArchiveHub, this path does not drop stale cursors itself;
+    // pruneConsumers is the host's explicit tool for that, §9 P18 — silently
+    // dropping a cursor as a SIDE EFFECT of an unrelated prune call would
+    // surprise a host reading only this method's contract).
+    let cursorFloor = Number.MAX_SAFE_INTEGER; // no consumers → unbounded
+    for (const c of this.store.cursorsForTopic(topic)) cursorFloor = Math.min(cursorFloor, c.lastRowid);
+
+    // "tail" SUB subscriber floor: never delete a row a connected tail
+    // subscriber's current SNAP window already served (subs.ts's group holds
+    // that window purely in the DELTA journal/rowsProvider() — there is no
+    // per-subscriber durable cursor to read the way onEntry consumers have
+    // one — so this is a coarser guard than the cursor floor above: block
+    // the request outright, mirroring retireTopic's own
+    // hasActiveSubscriber precondition, rather than silently narrowing what
+    // gets pruned). A hasActiveSubscriber caller wanting to shrink a live
+    // tail topic reduces keepNewest and retries once idle, exactly as
+    // retireTopic's callers wait out an active subscriber today.
+    if (this.hasActiveSubscriber?.(topic)) {
+      settle.push(() =>
+        item.reject(misuse(`pruneTopic: topic has an active tail subscriber (${topic})`)),
+      );
+      return;
+    }
+
+    let keepNewestFloor = Number.MAX_SAFE_INTEGER;
+    if (item.keepNewest !== undefined) {
+      const rows = this.store.entriesTailByRowid(topic, item.keepNewest);
+      // fewer than keepNewest rows exist → nothing to prune on this axis
+      keepNewestFloor = rows.length > 0 ? rows[0]!.rowid : Number.MAX_SAFE_INTEGER;
+    }
+
+    // The DELETE floor is the MOST conservative (smallest deletable range) of
+    // whichever bounds were supplied — pruneTopic() requires at least one.
+    const belowRowid = Math.min(cursorFloor, keepNewestFloor) - 1;
+    const hlcBefore = item.olderThanMs !== undefined ? this.clock() - item.olderThanMs : null;
+
+    if (belowRowid < 1) {
+      settle.push(() => item.resolve({ prunedRows: 0 }));
+      return;
+    }
+
+    // Pruning never changes a writer's contig/chain (only sq_log rows move;
+    // sq_writers is untouched), and vectors() reports stream heads/row
+    // COUNTS never enter it — so, unlike processRetireTopic just above
+    // (which deletes the sq_writers rows vectors() DOES read), there is
+    // nothing here for vectorsCache to invalidate.
+    const prunedRows = this.store.deleteLogRowsUpToRowid(topic, belowRowid, hlcBefore);
+    settle.push(() => item.resolve({ prunedRows }));
   }
 
   private recoveryIngest(

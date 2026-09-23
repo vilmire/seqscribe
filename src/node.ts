@@ -148,6 +148,18 @@ export interface SeqscribeNodeExt extends SeqscribeNode {
     idleForMs: number;
     isIdle: (topic: Topic) => boolean;
   }): Promise<{ retired: Topic[]; skipped: { topic: Topic; reason: string }[] }>;
+  // Local entry prune (G2b REQUESTED EDIT — host-guide `pruneTopic`). Unlike
+  // retireTopic (whole-writer-row GC on an EMPTY topic), shrinks a LIVE
+  // `full`-retention subscribe-only topic's durable sq_log row count without
+  // requiring a finality cert (ArchiveHub's own compaction does, and is
+  // fleet-coordinator-only — see writer-gc.ts). Refuses (ERR_MISUSE) on
+  // register-kind or full-sync-replicated topics, on a non-"full" retention
+  // topic, when neither olderThanMs nor keepNewest is given, or while the
+  // topic has an active "tail" SUB subscriber. Never deletes a row below any
+  // registered onEntry consumer's cursor. Local-only housekeeping — no
+  // signed authority, no cross-peer canonical state, same spirit as
+  // retireTopic's own doc comment.
+  pruneTopic(topic: Topic, o: { olderThanMs?: number; keepNewest?: number }): Promise<{ prunedRows: number }>;
   // Bounded inspection (P21)
   scanEntries(topic: Topic, o?: ScanOptions): ScanResult;
   headOrder(topic: Topic): Order | null; // pin scan `through` / comparison heads
@@ -307,9 +319,15 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
       consumers.notifyApplied(e.topic);
       views.notifyApplied(e.topic);
       registers.notifyApplied(e.topic);
-    } else {
-      subs.handleRingApplied(e); // ring topics: no durable row, tail groups feed live
     }
+    // Ring topics have no durable row, so their tail group's ONLY live feed
+    // is this hook. Full-retention subscribe-only topics DO get a durable
+    // row (the `if` above), but a "tail" SUB group may still be registered
+    // on them (G2b) — handleTailApplied no-ops via its own group lookup when
+    // the topic has no tail subscriber, so calling it unconditionally here
+    // (rather than threading a second "is this topic tail-subscribed" check
+    // through this hook) is the same one-line cost either way.
+    subs.handleTailApplied(e);
   });
 
   let closed = false;
@@ -528,6 +546,8 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
       consumers.pruneConsumers(topic, o),
     consumerCaughtUp: (topic: Topic, consumer: string) => consumers.caughtUp(topic, consumer),
     retireTopic: (topic: Topic) => core.retireTopic(topic),
+    pruneTopic: (topic: Topic, o: { olderThanMs?: number; keepNewest?: number }) =>
+      core.pruneTopic(topic, o),
     gcWriters: async (o: { topicPrefix: string; idleForMs: number; isIdle: (topic: Topic) => boolean }) => {
       if (closed) throw misuse("node is closed");
       const candidates = topics.list().filter((t) => t.startsWith(o.topicPrefix) && o.isIdle(t));

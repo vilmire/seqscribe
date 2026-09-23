@@ -28,6 +28,16 @@ import type { ViewChange, ViewHub } from "./views.js";
 const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const B64REV = new Map([...B64].map((c, i) => [c, i] as const));
 
+// "tail" SUB view window for a full-retention subscribe-only topic (G2b) —
+// the durable counterpart to a ring topic's `retention.size`. Deliberately
+// NOT a `Constants` field: SPEC §14's "Not constants" carve-out (the §14.1
+// scan page bounds) applies identically here — this bounds one synchronous
+// local read, not a protocol or storage behavior, so there is nothing for a
+// fleet to agree on. Same magnitude as RING_DEFAULT so the existing
+// MAX_REASSEMBLY_BYTES sizing note (constants.ts) — "largest legitimate SNAP
+// body ≈ RING_DEFAULT × MAX_ROW_BYTES" — stays true for full-topic tails too.
+const FULL_TAIL_DEFAULT = 500;
+
 export function b64encode(bytes: Uint8Array): string {
   let out = "";
   for (let i = 0; i < bytes.length; i += 3) {
@@ -213,8 +223,13 @@ export class SubHub {
     return `register\u0000${jcs({ topic })}`;
   }
 
-  // ring topic entries feed their topic's tail groups (rowid-null applies)
-  handleRingApplied(e: LogEntry): void {
+  // Live DELTA feed for "tail" groups — ring topics (rowid-null applies,
+  // node.ts's `else` branch) AND full-retention subscribe-only topics
+  // (durable applies, rowid !== null) share this: both are keyed by
+  // `ringKey(topic)` in resolveGroup above, so one lookup covers either
+  // shape and a subscriber sees the identical DELTA wire message regardless
+  // of which retention mode its topic uses.
+  handleTailApplied(e: LogEntry): void {
     const group = this.groups.get(this.ringKey(e.topic));
     if (!group) return;
     const row = this.ringRow(e);
@@ -266,18 +281,41 @@ export class SubHub {
       return group;
     }
 
-    // built-in ring tail: view "tail", params {topic}
+    // built-in ring/full tail: view "tail", params {topic}. Ring topics
+    // serve their in-memory tail (§14: no durable row). `full`-retention
+    // subscribe-only topics (e.g. `session.<id>.transcript` under G2b) serve
+    // the last FULL_TAIL_DEFAULT durable rows the SAME way — identical group
+    // shape, identical wire messages (SNAP/DELTA/Row), identical cursor-resume
+    // and epoch-reset semantics — so TranscriptReplicaStore-shaped consumers
+    // need zero wire-format change, only the topic's retention policy switch.
+    // `full-sync` and `register` topics are NOT served here: full-sync live
+    // delivery is the sync engine's push path (peers replicate the log
+    // itself), and a second "tail" delivery path would double-deliver;
+    // register topics have their own built-in "register" group above.
     if (view === "tail") {
       const topic = (params as { topic?: string } | null)?.topic;
       if (typeof topic !== "string") throw new SeqscribeError("ERR_UNKNOWN_VIEW", "tail needs {topic}");
       const policy = this.deps.topics.get(topic).policy;
-      if (policy.retention.mode !== "ring")
-        throw new SeqscribeError("ERR_UNKNOWN_VIEW", `tail serves ring topics only (${topic})`);
+      const mode = policy.retention.mode;
+      if (mode !== "ring" && mode !== "full")
+        throw new SeqscribeError(
+          "ERR_UNKNOWN_VIEW",
+          `tail serves ring or full subscribe-only topics only (${topic})`,
+        );
+      if (mode === "full" && policy.replication !== "subscribe-only")
+        throw new SeqscribeError(
+          "ERR_UNKNOWN_VIEW",
+          `tail on a full-retention topic requires subscribe-only replication (${topic})`,
+        );
       let epoch = this.ringEpochs.get(topic);
       if (epoch === undefined) {
         epoch = this.mintEpoch(); // restart = new epoch → SNAP reset (§9)
         this.ringEpochs.set(topic, epoch);
       }
+      const rowsProvider =
+        mode === "ring"
+          ? () => this.deps.core.ringTail(topic).map((e) => this.ringRow(e))
+          : () => this.deps.core.fullTail(topic, FULL_TAIL_DEFAULT).map((e) => this.ringRow(e));
       const group: Group = {
         key: this.ringKey(topic),
         viewName: null,
@@ -286,7 +324,7 @@ export class SubHub {
         deltaSeq: 0,
         journal: [],
         subs: new Map(),
-        rowsProvider: () => this.deps.core.ringTail(topic).map((e) => this.ringRow(e)),
+        rowsProvider,
       };
       this.groups.set(group.key, group);
       return group;
