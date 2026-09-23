@@ -5,7 +5,7 @@
 
 import { validateEntry } from "./codec.js";
 import { assertJsonValue, chainOf, seedOf } from "./encoding.js";
-import { SeqscribeError } from "./errors.js";
+import { misuse, SeqscribeError } from "./errors.js";
 import { hlcCompare, isOverEpsilon, merge, orderCompare, orderOf, stamp, type HlcState } from "./hlc.js";
 import type { Store, WriterRow } from "./store.js";
 import type { TopicRegistry } from "./topics.js";
@@ -86,7 +86,27 @@ interface AdoptCutItem {
   reject: (e: unknown) => void;
 }
 
-type QueueItem = AppendItem | ExternalItem | SealItem | CertItem | DirectiveItem | AdoptCutItem;
+// Writer-row GC (C7-7, retireTopic/gcWriters). Preconditions are checked
+// synchronously before enqueue (fast rejection for the common "not eligible"
+// case) AND re-checked inside the flush handler (mirrors processAppend's own
+// re-check of head.sealReason rather than trusting a preflight snapshot) — an
+// append for the same topic queued ahead of this item in the same batch must
+// make the retire observe a live row and refuse, not blindly delete under it.
+interface RetireTopicItem {
+  t: "retireTopic";
+  topic: Topic;
+  resolve: (r: { writersRemoved: number }) => void;
+  reject: (e: unknown) => void;
+}
+
+type QueueItem =
+  | AppendItem
+  | ExternalItem
+  | SealItem
+  | CertItem
+  | DirectiveItem
+  | AdoptCutItem
+  | RetireTopicItem;
 
 export interface RecoveryTarget {
   finalSeq: Seq;
@@ -118,6 +138,13 @@ export class LogCore {
   private readonly constants: Constants;
   private readonly emitAnomaly: (a: Anomaly) => void;
   private onApplied: AppliedHook | undefined;
+  // Writer-row GC precondition 4 (active consumer/subscriber): LogCore has no
+  // reference to ConsumerHub/SubHub (node.ts wires them, not this class), so
+  // node.ts supplies both checks here — set once at construction, exactly
+  // like setOnApplied. Both re-run inside the flush handler, not just at the
+  // public retireTopic()/gcWriters() call boundary (see RetireTopicItem).
+  private hasActiveConsumer: ((topic: Topic) => boolean) | undefined;
+  private hasActiveSubscriber: ((topic: Topic) => boolean) | undefined;
 
   private hlcState: HlcState;
   private readonly heads = new Map<string, WriterRow>();
@@ -214,6 +241,15 @@ export class LogCore {
     this.onApplied = hook;
   }
 
+  // Wired once from node.ts (ConsumerHub.listConsumers / SubHub.hasActiveSubscribersFor).
+  setActivityChecks(o: {
+    hasActiveConsumer: (topic: Topic) => boolean;
+    hasActiveSubscriber: (topic: Topic) => boolean;
+  }): void {
+    this.hasActiveConsumer = o.hasActiveConsumer;
+    this.hasActiveSubscriber = o.hasActiveSubscriber;
+  }
+
   // Internal wiring (not public API): hubs whose in-memory state is mutated
   // inside the commit transaction register here so a failed batch restores it
   // together with heads/certs/vectors (§8 rollback hygiene).
@@ -244,6 +280,30 @@ export class LogCore {
     if (this.closed) throw new SeqscribeError("ERR_MISUSE", "node is closed");
     return new Promise((resolve, reject) => {
       this.push({ t: "adopt", topic, cut, resolve, reject });
+    });
+  }
+
+  // C7-7 writer-row GC. Local housekeeping only — no signed authority, no
+  // cross-peer canonical state (§2.1 of the design: retireTopic/gcWriters
+  // only ever operate on subscribe-only topics with zero durable entries, so
+  // there is nothing for a signature to protect). Deletes every sq_writers
+  // row for `topic`. Idempotent: an already-empty topic is a successful
+  // no-op (the flush handler's listWriters(topic) loop iterates zero rows).
+  retireTopic(topic: Topic): Promise<{ writersRemoved: number }> {
+    if (this.closed) throw new SeqscribeError("ERR_MISUSE", "node is closed");
+    const entry = this.topics.get(topic); // ERR_UNKNOWN_TOPIC before enqueue
+    if (entry.policy.kind === "register") {
+      return Promise.reject(
+        misuse(`retireTopic: register-kind topics are not GC-eligible (${topic})`),
+      );
+    }
+    if (entry.policy.replication === "full-sync") {
+      return Promise.reject(
+        misuse(`retireTopic: full-sync topics are not GC-eligible (${topic})`),
+      );
+    }
+    return new Promise((resolve, reject) => {
+      this.push({ t: "retireTopic", topic, resolve, reject });
     });
   }
 
@@ -433,7 +493,8 @@ export class LogCore {
           else if (item.t === "seal") this.processSeal(item, settle, anomalies);
           else if (item.t === "cert") this.processCert(item, settle, anomalies);
           else if (item.t === "directive") this.processDirective(item, settle, anomalies);
-          else this.processAdopt(item, settle);
+          else if (item.t === "adopt") this.processAdopt(item, settle);
+          else this.processRetireTopic(item, settle);
         }
         this.store.metaSet(HLC_META_KEY, JSON.stringify(this.hlcState));
       });
@@ -635,6 +696,67 @@ export class LogCore {
       }
     }
     settle.push(() => item.resolve());
+  }
+
+  // C7-7 writer-row GC — see retireTopic()'s doc comment for the design
+  // rationale. Preconditions are re-checked here (not just at enqueue time,
+  // §2.6 of the design): a live durable entry or an append racing ahead of
+  // this item in the same batch must make the retire refuse, not delete
+  // under it. All re-checks throw (caught by flush()'s try/catch around the
+  // whole batch transaction, which rejects every item in the batch) — a
+  // retireTopic precondition failure must not silently no-op or partially
+  // apply, and must not poison sibling items in the same gcWriters batch, so
+  // gcWriters always issues ONE retireTopic per topic (never batches several
+  // topics into one queue item) and treats a rejected promise as "skipped".
+  private processRetireTopic(item: RetireTopicItem, settle: (() => void)[]): void {
+    const { topic } = item;
+    const entry = this.topics.get(topic); // still defined? (can't vanish mid-process — no undefine)
+    if (entry.policy.kind === "register") {
+      settle.push(() =>
+        item.reject(misuse(`retireTopic: register-kind topics are not GC-eligible (${topic})`)),
+      );
+      return;
+    }
+    if (entry.policy.replication === "full-sync") {
+      settle.push(() =>
+        item.reject(misuse(`retireTopic: full-sync topics are not GC-eligible (${topic})`)),
+      );
+      return;
+    }
+    if (this.store.logCount(topic) > 0) {
+      settle.push(() =>
+        item.reject(misuse(`retireTopic: topic has durable log entries (${topic})`)),
+      );
+      return;
+    }
+    if (this.hasActiveConsumer?.(topic)) {
+      settle.push(() =>
+        item.reject(misuse(`retireTopic: topic has an active consumer (${topic})`)),
+      );
+      return;
+    }
+    if (this.hasActiveSubscriber?.(topic)) {
+      settle.push(() =>
+        item.reject(misuse(`retireTopic: topic has an active subscriber (${topic})`)),
+      );
+      return;
+    }
+
+    const writers = this.store.listWriters(topic);
+    for (const w of writers) {
+      this.store.deleteWriter(topic, w.writer);
+      this.heads.delete(`${topic}\u0000${w.writer}`);
+    }
+    // Ring tail: no durable sq_log row for a ring topic (§14), so the tail
+    // held in memory is the only remaining trace once sq_writers is cleared.
+    if (this.ringUndo && !this.ringUndo.has(topic)) this.ringUndo.set(topic, this.rings.get(topic));
+    this.rings.delete(topic);
+    // Scoped cache invalidation, not the full heads/vectorsCache.clear() the
+    // rollback path uses — an unrelated hot topic's cached head must survive
+    // a concurrent sweep (§2.3 batching note).
+    if (this.vectorsCache) delete this.vectorsCache[topic];
+
+    settle.push(() => item.resolve({ writersRemoved: writers.length }));
   }
 
   private recoveryIngest(

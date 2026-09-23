@@ -126,6 +126,28 @@ export interface SeqscribeNodeExt extends SeqscribeNode {
   listConsumers(topic: Topic): ConsumerInfo[];
   pruneConsumers(topic: Topic, o?: { prefix?: string; inactiveBefore?: number }): string[];
   consumerCaughtUp(topic: Topic, consumer: string): Promise<{ throughRowid: number }>;
+  // C7-7 writer-row GC (design: scratchpad/seqscribe-retire-topic-design.md).
+  // Local housekeeping only — no signed authority, no cross-peer canonical
+  // state. Deletes every sq_writers row for `topic`; refuses (ERR_MISUSE) if
+  // the topic is register-kind, full-sync-replicated, has durable log rows,
+  // or has an active consumer/subscriber. Idempotent: retiring an
+  // already-empty topic is a successful no-op.
+  retireTopic(topic: Topic): Promise<{ writersRemoved: number }>;
+  // Sweep: retires every topic under `topicPrefix` for which `isIdle(topic)`
+  // returns true and retireTopic's preconditions hold. `idleForMs` documents
+  // the grace period the caller's `isIdle` is expected to enforce — the
+  // library has no independent clock for a ring topic (no durable rows to
+  // time), so idleness is host-determined. One retireTopic call per
+  // candidate topic (never batched into one queue item — see
+  // processRetireTopic's comment), so a precondition failure on one topic
+  // never blocks the rest of the sweep. Returns the topics actually retired
+  // and the ones skipped with why (mirrors pruneConsumers' bare-array
+  // return, not a generic errors object).
+  gcWriters(o: {
+    topicPrefix: string;
+    idleForMs: number;
+    isIdle: (topic: Topic) => boolean;
+  }): Promise<{ retired: Topic[]; skipped: { topic: Topic; reason: string }[] }>;
   // Bounded inspection (P21)
   scanEntries(topic: Topic, o?: ScanOptions): ScanResult;
   headOrder(topic: Topic): Order | null; // pin scan `through` / comparison heads
@@ -231,6 +253,12 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
   const subs = new SubHub({ views, core, topics, constants, timers, rng, registers });
   sync.setSubHub(subs);
   registers.onChange((topic) => subs.handleRegisterChanged(topic));
+  // C7-7 writer-row GC preconditions (retireTopic/gcWriters): LogCore has no
+  // direct reference to either hub, so wire both checks through here.
+  core.setActivityChecks({
+    hasActiveConsumer: (topic) => consumers.listConsumers(topic).some((c) => c.active),
+    hasActiveSubscriber: (topic) => subs.hasActiveSubscribersFor(topic),
+  });
   const directives = new DirectiveHub({
     core,
     store,
@@ -499,6 +527,34 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
     pruneConsumers: (topic: Topic, o?: { prefix?: string; inactiveBefore?: number }) =>
       consumers.pruneConsumers(topic, o),
     consumerCaughtUp: (topic: Topic, consumer: string) => consumers.caughtUp(topic, consumer),
+    retireTopic: (topic: Topic) => core.retireTopic(topic),
+    gcWriters: async (o: { topicPrefix: string; idleForMs: number; isIdle: (topic: Topic) => boolean }) => {
+      if (closed) throw misuse("node is closed");
+      const candidates = topics.list().filter((t) => t.startsWith(o.topicPrefix) && o.isIdle(t));
+      const retired: Topic[] = [];
+      const skipped: { topic: Topic; reason: string }[] = [];
+      // One retireTopic() call per candidate — each is its own queue item, so
+      // a precondition failure on one topic never aborts the sweep; LogCore's
+      // own GROUP_COMMIT_N=64 group-commit batches consecutive queue items
+      // into as few transactions as a tight loop naturally produces (the
+      // archiveCovered BATCH=2_000 precedent this mirrors is a chunk size,
+      // not a promise to serialize; awaiting per-topic here would defeat the
+      // batching this loop relies on, so all calls are issued before any
+      // await settles — Promise.allSettled, not a sequential for-await).
+      const results = await Promise.allSettled(candidates.map((t) => core.retireTopic(t)));
+      for (let i = 0; i < candidates.length; i++) {
+        const topic = candidates[i]!;
+        const r = results[i]!;
+        if (r.status === "fulfilled") retired.push(topic);
+        else skipped.push({ topic, reason: r.reason instanceof Error ? r.reason.message : String(r.reason) });
+      }
+      // Each retireTopic() already deletes vectorsCache[topic] individually
+      // (log.ts processRetireTopic) — no separate whole-cache invalidation
+      // needed; that per-topic delete IS the "invalidate once after the
+      // batch" the design calls for, since it never triggers the O(all
+      // writers) vectors() rebuild the way clearing the whole cache would.
+      return { retired, skipped };
+    },
     scanEntries,
     headOrder: (topic: Topic): Order | null => {
       if (closed) throw misuse("node is closed");

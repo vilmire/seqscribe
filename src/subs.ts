@@ -221,6 +221,22 @@ export class SubHub {
     this.publish(group, { upserts: [row], deletes: [] });
   }
 
+  // Writer-row GC precondition (retireTopic/gcWriters, C7-7): true if any
+  // session currently holds an active SUB on `topic`'s ring tail group. Ring
+  // topics (retireTopic's only target — full-sync topics are refused before
+  // this check runs) are served exclusively through the "tail" group keyed
+  // by ringTopic, never through a named view, so scanning `groups` for a
+  // matching `ringTopic` with a non-empty `subs` map is complete for that
+  // case. `groups` has no topic-keyed index (it's keyed by `view\0params`),
+  // so this is a linear scan — acceptable here: called once per candidate
+  // topic in a boot-time sweep, not per-request.
+  hasActiveSubscribersFor(topic: Topic): boolean {
+    for (const group of this.groups.values()) {
+      if (group.ringTopic === topic && group.subs.size > 0) return true;
+    }
+    return false;
+  }
+
   // ---- server: internals ----
 
   private resolveGroup(view: string, params: JsonValue): Group {

@@ -326,6 +326,15 @@ export class Store {
     );
   }
 
+  // Writer-row GC (retireTopic/gcWriters). Deletes exactly one (topic, writer)
+  // row — unlike sealing (upsertWriter with seal_reason='retired'), this is a
+  // real DELETE, only ever used on subscribe-only ring/none topics with no
+  // durable entries (LogCore.retireTopic enforces the preconditions before
+  // calling this; this method itself does not re-check them).
+  deleteWriter(topic: Topic, writer: WriterId): void {
+    this.db.run("DELETE FROM sq_writers WHERE topic=? AND writer=?", [topic, writer]);
+  }
+
   pendingPut(e: LogEntry): void {
     this.db.run(
       "INSERT OR REPLACE INTO sq_pending (topic, writer, seq, entry) VALUES (?, ?, ?, ?)",
