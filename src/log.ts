@@ -488,6 +488,24 @@ export class LogCore {
     return this.store.entriesTailByRowid(topic, limit).map((r) => r.entry);
   }
 
+  // Newest-first backward page over the same window fullTail()/ringTail()
+  // serve (tail-snapshot selectors). Ring entries have no rowid, so their
+  // 1-based ring position stands in for it — the only property a caller may
+  // rely on is "strictly decreasing, usable as the next `beforeRowid`".
+  tailPage(
+    topic: Topic,
+    ring: boolean,
+    beforeRowid: number | null,
+    limit: number,
+  ): { entry: LogEntry; rowid: number }[] {
+    if (!ring) return this.store.entriesTailPage(topic, beforeRowid, limit);
+    const tail = this.rings.get(topic) ?? [];
+    const end = beforeRowid === null ? tail.length : Math.min(tail.length, beforeRowid - 1);
+    const out: { entry: LogEntry; rowid: number }[] = [];
+    for (let i = end - 1; i >= 0 && out.length < limit; i--) out.push({ entry: tail[i]!, rowid: i + 1 });
+    return out;
+  }
+
   entries(topic: Topic, writer: WriterId, fromSeq: Seq, toSeq: Seq): LogEntry[] {
     return this.store.entriesRange(topic, writer, fromSeq, toSeq).map((r) => r.entry);
   }

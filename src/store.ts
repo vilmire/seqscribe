@@ -208,6 +208,27 @@ export class Store {
     return rows;
   }
 
+  // Newest-first page of `topic`'s rows strictly below `beforeRowid` (null =
+  // from the head). The backward walk a tail-snapshot selector uses to find a
+  // window boundary without materializing the whole FULL_TAIL_DEFAULT tail.
+  entriesTailPage(
+    topic: Topic,
+    beforeRowid: number | null,
+    limit: number,
+  ): { entry: LogEntry; rowid: number }[] {
+    const rows =
+      beforeRowid === null
+        ? this.db.all<RawLogRow>(
+            "SELECT rowid, * FROM sq_log WHERE topic = ? ORDER BY rowid DESC LIMIT ?",
+            [topic, limit],
+          )
+        : this.db.all<RawLogRow>(
+            "SELECT rowid, * FROM sq_log WHERE topic = ? AND rowid < ? ORDER BY rowid DESC LIMIT ?",
+            [topic, beforeRowid, limit],
+          );
+    return rows.map(rowToEntry);
+  }
+
   // Total-order iteration (§1): entries strictly after `after` in
   // (hlc_l, hlc_c, writer, seq) order; after=null starts from the beginning.
   entriesAfterOrder(topic: Topic, after: Order | null, limit: number): LogEntry[] {

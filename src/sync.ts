@@ -217,6 +217,11 @@ export class SyncEngine {
       onControl: (s, m) => this.onControl(s, m),
       onData: (s, m) => this.onData(s, m),
       onCapacity: (s) => {
+        // SUB resyncs/paced SNAPs first: they take at most half the lane
+        // (SubHub.snapWindow), so ENTRIES still refill the rest — the other
+        // order lets a bulk catch-up keep the lane full and starve a
+        // subscriber's resync for its whole duration.
+        this.subHub?.handleCapacity(s);
         const ps2 = this.peers.get(s);
         if (ps2) this.pumpDirty(ps2);
       },

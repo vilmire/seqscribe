@@ -93,4 +93,5 @@ export {
   type ScanResult,
 } from "./node.js";
 export type { TopicSyncCounters } from "./sync.js";
+export type { SubStats, SubResyncReason, TailSource, TailSnapshotSelector } from "./subs.js";
 export type { ConsumerInfo, ConsumerResetResult } from "./consume.js";

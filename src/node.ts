@@ -16,7 +16,7 @@ import { ArchiveHub } from "./archive.js";
 import { RegisterHub } from "./register.js";
 import { SnapshotHub } from "./snapshot.js";
 import { Store } from "./store.js";
-import { SubHub } from "./subs.js";
+import { SubHub, type SubStats, type TailSnapshotSelector } from "./subs.js";
 import { SyncEngine, type TopicSyncCounters } from "./sync.js";
 import { TopicRegistry } from "./topics.js";
 import { ViewHub } from "./views.js";
@@ -101,6 +101,10 @@ export interface NodeStats {
   // P24 — top-5 (topic, peer) pairs by served+applied bytes this interval;
   // bounded, and both identifiers are already public elsewhere in stats()
   syncHotspots: { topic: Topic; peerId: string; bytes: number }[];
+  // SUB serving counters (host-guide §4.6) — cumulative since start, plus
+  // three gauges. Always present on a node's stats(); optional in the type
+  // only so hand-built NodeStats fixtures stay valid.
+  subs?: SubStats;
 }
 
 export interface SeqscribeNodeExt extends SeqscribeNode {
@@ -115,6 +119,9 @@ export interface SeqscribeNodeExt extends SeqscribeNode {
   // stats() itself, now opt-in: leaving it uncalled simply makes the interval
   // counters cumulative-since-start, which no reader can corrupt for another.
   drainSyncInterval(): { topics: Record<Topic, TopicSyncCounters>; syncHotspots: NodeStats["syncHotspots"] };
+  // Tail-snapshot selector (host-guide §4.6): choose the rows a built-in
+  // "tail" SNAP carries, per topic. null restores the default window.
+  setTailSnapshotSelector(sel: TailSnapshotSelector | null): void;
   // Durable-consumer lifecycle (proposals-v3.5 P17–P19) — reset/delete/prune
   // are inactive-consumer operations; caughtUp needs the consumer registered.
   resetConsumer(
@@ -262,7 +269,7 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
     emitAnomaly,
     authority: opts.authority,
   });
-  const subs = new SubHub({ views, core, topics, constants, timers, rng, registers });
+  const subs = new SubHub({ views, core, topics, constants, timers, rng, registers, emitAnomaly });
   sync.setSubHub(subs);
   registers.onChange((topic) => subs.handleRegisterChanged(topic));
   // C7-7 writer-row GC preconditions (retireTopic/gcWriters): LogCore has no
@@ -490,7 +497,12 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
     // interval counters now accumulate until a host explicitly calls
     // drainSyncInterval(), so any number of readers at any cadence is safe.
     const interval = sync.readIntervalStats();
-    const out: NodeStats = { topics: {}, peers: sync.peerStats(), syncHotspots: interval.hotspots };
+    const out: NodeStats = {
+      topics: {},
+      peers: sync.peerStats(),
+      syncHotspots: interval.hotspots,
+      subs: subs.stats(),
+    };
     const now = clock();
     for (const topic of topics.list()) {
       const cert = core.getCert(topic);
@@ -538,6 +550,7 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
       for (const [t, c] of i.topics) topics[t] = c;
       return { topics, syncHotspots: i.hotspots };
     },
+    setTailSnapshotSelector: (sel: TailSnapshotSelector | null) => subs.setTailSnapshotSelector(sel),
     resetConsumer: (topic: Topic, consumer: string, o?: { from?: "earliest-retained" | "head" }) =>
       consumers.resetConsumer(topic, consumer, o),
     deleteConsumer: (topic: Topic, consumer: string) => consumers.deleteConsumer(topic, consumer),

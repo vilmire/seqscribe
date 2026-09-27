@@ -350,7 +350,8 @@ export interface Anomaly {
     | "consumer_abandoned"
     | "canonical_unavailable"
     | "sync_stalled" // extension (proposals-v3.5 P22): WANT rounds toward a peer stopped progressing
-    | "sync_hot"; // extension (proposals-v3.5 P24): sync moved ≥ SYNC_HOT_BYTES within one SYNC_HOT_WINDOW_MS — informational, never a throttle
+    | "sync_hot" // extension (proposals-v3.5 P24): sync moved ≥ SYNC_HOT_BYTES within one SYNC_HOT_WINDOW_MS — informational, never a throttle
+    | "sub_resync"; // extension (host-guide §4.6): a SUB subscriber stopped taking DELTAs (full data lane or oversized delta) and owes one coalesced SNAP
   entry?: LogEntry;
   // Identifiers for the subject of the anomaly (proposals-v3.8 P32). All
   // optional and all kind-dependent: an implementation that omits them stays
@@ -361,10 +362,14 @@ export interface Anomaly {
   // already exposed through stats(). `entry` remains the only field carrying
   // user/agent payload, and the §14 advice not to log it is unchanged.
   topic?: Topic;
-  peerId?: string; // sync_stalled, sync_hot
+  peerId?: string; // sync_stalled, sync_hot, sub_resync
   writer?: WriterId; // sync_stalled, writer_forked, entry_quarantined
-  view?: string; // view_faulted, delta_mismatch
+  view?: string; // view_faulted, delta_mismatch, sub_resync
   consumer?: string; // consumer_abandoned
+  // sub_resync only: why the subscriber fell back to a SNAP — its session's
+  // data lane was full ("backpressure") or one DELTA exceeded MAX_FRAME_BYTES
+  // ("oversized"). An enum, never content.
+  reason?: "backpressure" | "oversized";
 }
 
 export interface SeqscribeNode {
