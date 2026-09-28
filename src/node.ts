@@ -161,11 +161,14 @@ export interface SeqscribeNodeExt extends SeqscribeNode {
   // requiring a finality cert (ArchiveHub's own compaction does, and is
   // fleet-coordinator-only — see writer-gc.ts). Refuses (ERR_MISUSE) on
   // register-kind or full-sync-replicated topics, on a non-"full" retention
-  // topic, when neither olderThanMs nor keepNewest is given, or while the
-  // topic has an active "tail" SUB subscriber. Never deletes a row below any
-  // registered onEntry consumer's cursor. Local-only housekeeping — no
-  // signed authority, no cross-peer canonical state, same spirit as
-  // retireTopic's own doc comment.
+  // topic, when neither olderThanMs nor keepNewest is given, or when the
+  // topic has an active "tail" SUB subscriber AND the prune would reach into
+  // the tail window (the newest FULL_TAIL_DEFAULT rows a SNAP(reset) can
+  // serve) — pruning strictly below that window is allowed while subscribed,
+  // since no subscriber ever re-reads a durable row older than it. Never
+  // deletes a row below any registered onEntry consumer's cursor. Local-only
+  // housekeeping — no signed authority, no cross-peer canonical state, same
+  // spirit as retireTopic's own doc comment.
   pruneTopic(topic: Topic, o: { olderThanMs?: number; keepNewest?: number }): Promise<{ prunedRows: number }>;
   // Bounded inspection (P21)
   scanEntries(topic: Topic, o?: ScanOptions): ScanResult;

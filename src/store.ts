@@ -5,6 +5,18 @@
 import { SeqscribeError } from "./errors.js";
 import type { JsonValue, LogEntry, Order, Seq, SqliteHandle, Topic, WriterId } from "./types.js";
 
+// sq_log_topic_rowid — per-topic rowid order. A single-column index carries
+// rowid as its trailing key, so "WHERE topic=? [AND rowid<?|>?] ORDER BY rowid
+// [DESC] LIMIT ?" (tail SNAP, tail-snapshot selector pages, per-topic cursor
+// walks, pruneTopic) is an index range walk instead of the UNIQUE(topic,
+// writer, seq) autoindex lookup + TEMP B-TREE sort of every row of the topic
+// (payload included) that those reads paid before — measured at ~2 minutes of
+// blocked event loop per 64-row page on a 160k-row / 2.3 GB topic
+// (2026-09-28). IF NOT EXISTS: an existing DB builds it once on its next
+// open — one pass over sq_log's leaf pages (topic sits in the local part of
+// every row, so overflow pages holding large payloads are not read), ~2-3 s
+// on a 3.5 GB / 296k-row DB. The DDL string below must stay free of ';'
+// inside comments: init() splits it on ';'.
 const DDL = `
 CREATE TABLE IF NOT EXISTS sq_log (
   rowid INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -17,6 +29,7 @@ CREATE TABLE IF NOT EXISTS sq_log (
   UNIQUE (topic, writer, seq));
 CREATE INDEX IF NOT EXISTS sq_log_order ON sq_log (topic, hlc_l, hlc_c, writer, seq);
 CREATE INDEX IF NOT EXISTS sq_log_key ON sq_log (topic, key) WHERE key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS sq_log_topic_rowid ON sq_log (topic);
 
 CREATE TABLE IF NOT EXISTS sq_pending (topic TEXT, writer TEXT, seq INTEGER, entry TEXT,
   PRIMARY KEY (topic, writer, seq));
@@ -184,7 +197,7 @@ export class Store {
   ): { entry: LogEntry; rowid: number }[] {
     return this.db
       .all<RawLogRow>(
-        "SELECT rowid, * FROM sq_log WHERE topic = ? AND rowid > ? ORDER BY rowid LIMIT ?",
+        "SELECT rowid, * FROM sq_log INDEXED BY sq_log_topic_rowid WHERE topic = ? AND rowid > ? ORDER BY rowid LIMIT ?",
         [topic, afterRowid, limit],
       )
       .map(rowToEntry);
@@ -197,15 +210,38 @@ export class Store {
   // does not reliably use the `sq_log` rowid ordering for a wrapped subquery
   // ORDER BY without a matching index hint, and this method runs on every
   // fresh/reset SUB — worth the second round trip to keep the plan obvious.
+  // Every per-topic rowid-ordered read here names INDEXED BY
+  // sq_log_topic_rowid: without it the planner may pick the (topic, writer,
+  // seq) autoindex + a TEMP B-TREE sort of the whole topic, or (with ANALYZE
+  // stats) a PK range walk across every other topic's rows — both
+  // topic-size-proportional for a LIMIT-bounded page. init() always creates
+  // the index, so the hint can never name a missing one.
   entriesTailByRowid(topic: Topic, limit: number): { entry: LogEntry; rowid: number }[] {
     const rows = this.db
-      .all<RawLogRow>("SELECT rowid, * FROM sq_log WHERE topic = ? ORDER BY rowid DESC LIMIT ?", [
-        topic,
-        limit,
-      ])
+      .all<RawLogRow>(
+        "SELECT rowid, * FROM sq_log INDEXED BY sq_log_topic_rowid WHERE topic = ? ORDER BY rowid DESC LIMIT ?",
+        [topic, limit],
+      )
       .map(rowToEntry);
     rows.reverse(); // DESC fetch, ASC delivery — oldest-first, same as ringTail()
     return rows;
+  }
+
+  // Rowid of the `n`-th newest row of `topic` (n >= 1), or null when the topic
+  // holds fewer than `n` rows. A rowid-only walk of sq_log_topic_rowid — never
+  // reads a payload — so pruneTopic's keepNewest floor costs O(n) index
+  // entries instead of materializing (and JSON-parsing) the n newest rows the
+  // way entriesTailByRowid(topic, n) would. keepNewest is routinely "all but
+  // the oldest few hundred rows" (writer-gc steps down from the current row
+  // count), so that materialization was a whole-topic read: on a 160k-row /
+  // 2.3 GB transcript topic it exhausted the V8 heap (daemon OOM, 2026-09-28).
+  rowidAtTailOffset(topic: Topic, n: number): number | null {
+    if (!Number.isSafeInteger(n) || n < 1) return null;
+    const r = this.db.get<{ rowid: number }>(
+      "SELECT rowid FROM sq_log INDEXED BY sq_log_topic_rowid WHERE topic = ? ORDER BY rowid DESC LIMIT 1 OFFSET ?",
+      [topic, n - 1],
+    );
+    return r ? r.rowid : null;
   }
 
   // Newest-first page of `topic`'s rows strictly below `beforeRowid` (null =
@@ -219,11 +255,11 @@ export class Store {
     const rows =
       beforeRowid === null
         ? this.db.all<RawLogRow>(
-            "SELECT rowid, * FROM sq_log WHERE topic = ? ORDER BY rowid DESC LIMIT ?",
+            "SELECT rowid, * FROM sq_log INDEXED BY sq_log_topic_rowid WHERE topic = ? ORDER BY rowid DESC LIMIT ?",
             [topic, limit],
           )
         : this.db.all<RawLogRow>(
-            "SELECT rowid, * FROM sq_log WHERE topic = ? AND rowid < ? ORDER BY rowid DESC LIMIT ?",
+            "SELECT rowid, * FROM sq_log INDEXED BY sq_log_topic_rowid WHERE topic = ? AND rowid < ? ORDER BY rowid DESC LIMIT ?",
             [topic, beforeRowid, limit],
           );
     return rows.map(rowToEntry);

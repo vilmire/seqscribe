@@ -8,6 +8,7 @@ import { assertJsonValue, chainOf, seedOf } from "./encoding.js";
 import { misuse, SeqscribeError } from "./errors.js";
 import { hlcCompare, isOverEpsilon, merge, orderCompare, orderOf, stamp, type HlcState } from "./hlc.js";
 import type { Store, WriterRow } from "./store.js";
+import { FULL_TAIL_DEFAULT } from "./subs.js";
 import type { TopicRegistry } from "./topics.js";
 import type {
   Anomaly,
@@ -898,34 +899,53 @@ export class LogCore {
     let cursorFloor = Number.MAX_SAFE_INTEGER; // no consumers → unbounded
     for (const c of this.store.cursorsForTopic(topic)) cursorFloor = Math.min(cursorFloor, c.lastRowid);
 
-    // "tail" SUB subscriber floor: never delete a row a connected tail
-    // subscriber's current SNAP window already served (subs.ts's group holds
-    // that window purely in the DELTA journal/rowsProvider() — there is no
-    // per-subscriber durable cursor to read the way onEntry consumers have
-    // one — so this is a coarser guard than the cursor floor above: block
-    // the request outright, mirroring retireTopic's own
-    // hasActiveSubscriber precondition, rather than silently narrowing what
-    // gets pruned). A hasActiveSubscriber caller wanting to shrink a live
-    // tail topic reduces keepNewest and retries once idle, exactly as
-    // retireTopic's callers wait out an active subscriber today.
-    if (this.hasActiveSubscriber?.(topic)) {
-      settle.push(() =>
-        item.reject(misuse(`pruneTopic: topic has an active tail subscriber (${topic})`)),
-      );
-      return;
-    }
-
     let keepNewestFloor = Number.MAX_SAFE_INTEGER;
     if (item.keepNewest !== undefined) {
-      const rows = this.store.entriesTailByRowid(topic, item.keepNewest);
-      // fewer than keepNewest rows exist → nothing to prune on this axis
-      keepNewestFloor = rows.length > 0 ? rows[0]!.rowid : Number.MAX_SAFE_INTEGER;
+      const keep = Math.floor(item.keepNewest);
+      if (keep === 0) {
+        keepNewestFloor = Number.MAX_SAFE_INTEGER; // keep nothing on this axis
+      } else if (keep < 0) {
+        keepNewestFloor = 0; // nonsensical bound — prune nothing
+      } else {
+        // Rowid-only index walk (store.rowidAtTailOffset) — never
+        // materialize the kept rows themselves: keepNewest is routinely
+        // "all but the oldest few hundred" (writer-gc steps down from the
+        // current row count), so reading them was a whole-topic read.
+        // Fewer than keepNewest rows exist → nothing to prune on this axis.
+        keepNewestFloor = this.store.rowidAtTailOffset(topic, keep) ?? 0;
+      }
     }
 
     // The DELETE floor is the MOST conservative (smallest deletable range) of
     // whichever bounds were supplied — pruneTopic() requires at least one.
     const belowRowid = Math.min(cursorFloor, keepNewestFloor) - 1;
     const hlcBefore = item.olderThanMs !== undefined ? this.clock() - item.olderThanMs : null;
+
+    // "tail" SUB subscriber floor. A connected tail subscriber holds its SNAP
+    // rows in memory and then follows appends as DELTAs; a resume replays the
+    // in-memory journal, and anything else (journal overrun, backpressure,
+    // oversized DELTA, a fresh SUB) is a SNAP(reset) re-read from the CURRENT
+    // tail window — the newest FULL_TAIL_DEFAULT rows, of which a tail
+    // snapshot selector only ever serves a suffix (subs.ts resolveGroup /
+    // selectTail). No subscriber state ever re-reads a durable row older than
+    // that window, so deleting strictly below it cannot open a gap for anyone
+    // attached. A prune whose floor reaches INTO the window is still refused
+    // outright (not silently narrowed) — that would shrink what the next
+    // SNAP(reset) serves, which is the caller's call to make once idle.
+    //
+    // Refusing every prune while a subscriber is attached (the previous rule)
+    // meant a transcript topic with a permanently open viewer was never pruned
+    // at all: measured 2026-09-28, 160k rows / 2.3 GB on one topic whose
+    // siblings sat at the host's 600-row cap.
+    if (belowRowid >= 1 && this.hasActiveSubscriber?.(topic)) {
+      const windowFloor = this.store.rowidAtTailOffset(topic, FULL_TAIL_DEFAULT);
+      if (windowFloor === null || belowRowid >= windowFloor) {
+        settle.push(() =>
+          item.reject(misuse(`pruneTopic: topic has an active tail subscriber (${topic})`)),
+        );
+        return;
+      }
+    }
 
     if (belowRowid < 1) {
       settle.push(() => item.resolve({ prunedRows: 0 }));

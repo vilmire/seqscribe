@@ -19,7 +19,7 @@ import { SeededRng } from "../harness/rng.js";
 import { Scheduler } from "../harness/scheduler.js";
 import { fileHandle, memoryHandle } from "../harness/sqlite.js";
 import { createSeqscribe, SeqscribeError } from "../src/index.js";
-import type { SeqscribeNodeExt, TopicPolicy } from "../src/index.js";
+import type { Row, SeqscribeNodeExt, SqliteHandle, TopicPolicy } from "../src/index.js";
 
 const dir = mkdtempSync(join(tmpdir(), "seqscribe-prune-topic-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -196,6 +196,138 @@ describe("pruneTopic", () => {
 
     unsub();
   });
+
+  // Incident 2026-09-28: the keepNewest floor used to be computed by reading
+  // the `keepNewest` newest rows in full (entriesTailByRowid) and taking the
+  // oldest one's rowid. writer-gc steps a big topic down with keepNewest =
+  // rows - 250, so that was a whole-topic materialization + JSON.parse — on a
+  // 160k-row / 2.3 GB transcript topic it ran the daemon out of V8 heap from
+  // the append-queue flush timer. The floor must be a rowid-only read.
+  it("computes the keepNewest floor without reading any kept row's payload", async () => {
+    const sched = new Scheduler(0);
+    const sqls: string[] = [];
+    const inner = memoryHandle();
+    const storage: SqliteHandle = {
+      run: (sql, params) => inner.run(sql, params),
+      get: (sql, params) => {
+        sqls.push(sql);
+        return inner.get(sql, params);
+      },
+      all: (sql, params) => {
+        sqls.push(sql);
+        return inner.all(sql, params);
+      },
+      transaction: (fn) => inner.transaction(fn),
+      acquireOwnerLock: () => inner.acquireOwnerLock(),
+      releaseOwnerLock: () => inner.releaseOwnerLock(),
+    };
+    const node = createSeqscribe({
+      writerId: "w1",
+      storage,
+      clock: sched.clock(),
+      timers: sched.timers(),
+    }) as SeqscribeNodeExt;
+    const topic = "session.p11.transcript";
+    node.defineTopic(topic, FULL_SUBSCRIBE_ONLY);
+    for (let i = 0; i < 2_000; i++) void node.log(topic).append("chunk", { i });
+    await sched.run();
+
+    sqls.length = 0;
+    const r = await run(sched, node.pruneTopic(topic, { keepNewest: 1_990 }));
+    expect(r.prunedRows).toBe(10);
+    expect(node.stats().topics[topic]?.logRows).toBe(1_990);
+    const payloadReads = sqls.filter((q) => /FROM sq_log\b/.test(q) && /SELECT\s+rowid\s*,\s*\*/i.test(q));
+    expect(payloadReads).toEqual([]);
+  }, 20_000);
+
+  it("an active tail subscriber does not block a prune strictly below the tail window; the subscriber keeps streaming", async () => {
+    const sched = new Scheduler(0);
+    const rng = new SeededRng(61);
+    const server = makeNode(sched, "server");
+    const client = makeNode(sched, "client");
+    const topic = "session.p12.transcript";
+    server.defineTopic(topic, FULL_SUBSCRIBE_ONLY);
+    client.defineTopic(topic, FULL_SUBSCRIBE_ONLY);
+    for (let i = 0; i < 700; i++) void server.log(topic).append("chunk", { i });
+    await sched.run({ untilMs: 100 });
+
+    const link = new VirtualLink(sched, rng);
+    server.attach(link.a, { peerId: "client", peerClass: "metadata", grants: { [topic]: "serve" } });
+    const handle = client.attach(link.b, {
+      peerId: "server",
+      peerClass: "metadata",
+      grants: { [topic]: "none" },
+    });
+    await sched.run({ untilMs: 400 });
+
+    const sub = client.subscribe(handle, { view: "tail", params: { topic } });
+    const snaps: Row[][] = [];
+    const deltas: Row[][] = [];
+    const offSnap = sub.onSnapshot((rows) => snaps.push(rows));
+    const offDelta = sub.onDelta((d) => deltas.push(d.upserts));
+    await sched.run({ untilMs: 800 });
+    expect(snaps).toHaveLength(1);
+    expect(snaps[0]!.map((r) => r.seq)).toEqual(Array.from({ length: 500 }, (_, i) => 201 + i));
+
+    // 600 kept ≥ the 500-row tail window → allowed while subscribed.
+    const r = await run(sched, server.pruneTopic(topic, { keepNewest: 600 }), sched.now() + 200);
+    expect(r.prunedRows).toBe(100);
+    expect(server.stats().topics[topic]?.logRows).toBe(600);
+
+    // Live stream unaffected: the next append arrives as a DELTA, no reset.
+    void server.log(topic).append("chunk", { i: 700 });
+    await sched.run({ untilMs: sched.now() + 400 });
+    expect(snaps).toHaveLength(1);
+    expect(deltas.flat().map((row) => row.seq)).toEqual([701]);
+
+    // A fresh subscriber (the same path a SNAP(reset) takes) is served the
+    // current window from what survived the prune — no gap, no error.
+    const sub2 = client.subscribe(handle, { view: "tail", params: { topic } });
+    const snaps2: Row[][] = [];
+    const offSnap2 = sub2.onSnapshot((rows) => snaps2.push(rows));
+    await sched.run({ untilMs: sched.now() + 400 });
+    expect(snaps2).toHaveLength(1);
+    expect(snaps2[0]!.map((row) => row.seq)).toEqual(Array.from({ length: 500 }, (_, i) => 202 + i));
+
+    offSnap();
+    offDelta();
+    offSnap2();
+  }, 20_000);
+
+  it("an active tail subscriber still blocks a prune reaching into the tail window (count or age-only)", async () => {
+    const sched = new Scheduler(0);
+    const rng = new SeededRng(62);
+    const server = makeNode(sched, "server");
+    const client = makeNode(sched, "client");
+    const topic = "session.p13.transcript";
+    server.defineTopic(topic, FULL_SUBSCRIBE_ONLY);
+    client.defineTopic(topic, FULL_SUBSCRIBE_ONLY);
+    for (let i = 0; i < 700; i++) void server.log(topic).append("chunk", { i });
+    await sched.run({ untilMs: 100 });
+
+    const link = new VirtualLink(sched, rng);
+    server.attach(link.a, { peerId: "client", peerClass: "metadata", grants: { [topic]: "serve" } });
+    const handle = client.attach(link.b, {
+      peerId: "server",
+      peerClass: "metadata",
+      grants: { [topic]: "none" },
+    });
+    await sched.run({ untilMs: 400 });
+    const sub = client.subscribe(handle, { view: "tail", params: { topic } });
+    const unsub = sub.onSnapshot(() => {});
+    await sched.run({ untilMs: 800 });
+
+    const intoWindow = runRejecting(sched, server.pruneTopic(topic, { keepNewest: 499 }), sched.now() + 200);
+    await expect(intoWindow).rejects.toThrow(/active tail subscriber/);
+    const ageOnly = runRejecting(sched, server.pruneTopic(topic, { olderThanMs: 0 }), sched.now() + 200);
+    await expect(ageOnly).rejects.toThrow(/active tail subscriber/);
+    expect(server.stats().topics[topic]?.logRows).toBe(700);
+
+    // exactly the window kept is still "strictly below" → allowed
+    const r = await run(sched, server.pruneTopic(topic, { keepNewest: 500 }), sched.now() + 200);
+    expect(r.prunedRows).toBe(200);
+    unsub();
+  }, 20_000);
 
   it("refuses a full-sync topic", async () => {
     const sched = new Scheduler(0);

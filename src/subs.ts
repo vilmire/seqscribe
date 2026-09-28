@@ -52,7 +52,7 @@ const PAD = 61; // "="
 // fleet to agree on. Same magnitude as RING_DEFAULT so the existing
 // MAX_REASSEMBLY_BYTES sizing note (constants.ts) — "largest legitimate SNAP
 // body ≈ RING_DEFAULT × MAX_ROW_BYTES" — stays true for full-topic tails too.
-const FULL_TAIL_DEFAULT = 500;
+export const FULL_TAIL_DEFAULT = 500;
 
 export function b64encode(bytes: Uint8Array): string {
   const n = bytes.length;
