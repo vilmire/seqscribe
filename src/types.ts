@@ -15,7 +15,7 @@ export type Seq = number; // per (topic, writer) stream, monotonic from 1, gap-f
 export type Hlc = { l: number; c: number };
 export type EntryId = [Topic, WriterId, Seq];
 export type Order = { l: number; c: number; writer: WriterId; seq: Seq };
-export type Key = string; // register only, UTF-8 ≤512B
+export type Key = string; // register, or a keyed append topic (TopicPolicy.keyed); UTF-8 ≤512B
 
 export interface LogEntry {
   topic: Topic;
@@ -177,6 +177,13 @@ export interface TopicPolicy {
   finalityAuthority?: string;
   hintKeys?: "plain" | "hash";
   flushThrottleMs?: number;
+  // Keyed append (local storage extension, host-guide §4.7 — NOT part of
+  // topicSchemaHash, like retention/replication). Legal only on kind "append"
+  // + retention "full" + replication "subscribe-only". Every append MUST carry
+  // a `key`; the newest row per key is the key's current value, and a row of
+  // `tombstoneKind` marks the key deleted. Enables pruneSuperseded and the
+  // newest-per-key "tail" SNAP default.
+  keyed?: { tombstoneKind: string };
 }
 
 export interface AuthorityHooks {
@@ -375,7 +382,9 @@ export interface Anomaly {
 export interface SeqscribeNode {
   defineTopic(topic: Topic, policy: TopicPolicy): void;
   log(topic: Topic): {
-    append(kind: string, payload: JsonValue, o?: { ref?: EntryId }): Promise<EntryId>;
+    // `key` is accepted only on a keyed topic (TopicPolicy.keyed), where it is
+    // mandatory — both mismatches reject with ERR_MISUSE.
+    append(kind: string, payload: JsonValue, o?: { ref?: EntryId; key?: Key }): Promise<EntryId>;
   };
   register(topic: Topic): RegisterHandle;
   onEntry(topic: Topic, consumer: string, cb: (e: LogEntry) => void | Promise<void>): Unsub;

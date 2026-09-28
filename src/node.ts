@@ -67,6 +67,20 @@ export interface ScanResult {
   nextFromSeq?: Seq; // writer form resume token
 }
 
+// Keyed-append bounded read (host-guide §4.7 `scanLatestPerKey`): one page of
+// the newest row per key, rowid order, optionally judged at a watermark.
+export interface KeyedScanOptions {
+  uptoRowid?: number; // inclusive watermark: rows above it are neither returned nor superseding
+  afterRowid?: number; // exclusive resume bound, default 0
+  limit?: number; // page bound — default 500, hard cap 10_000 (the §14.1 scan bounds)
+}
+
+export interface KeyedScanResult {
+  entries: { entry: LogEntry; rowid: number }[];
+  complete: boolean; // false = limit truncated the page; resume via nextAfterRowid
+  nextAfterRowid?: number;
+}
+
 // Observability surface (extension beyond SPEC §14 — proposals-v3.5). The
 // host-guide's baseline metrics, one call away.
 export interface NodeStats {
@@ -170,6 +184,27 @@ export interface SeqscribeNodeExt extends SeqscribeNode {
   // housekeeping — no signed authority, no cross-peer canonical state, same
   // spirit as retireTopic's own doc comment.
   pruneTopic(topic: Topic, o: { olderThanMs?: number; keepNewest?: number }): Promise<{ prunedRows: number }>;
+  // Keyed-append housekeeping (host-guide §4.7; TopicPolicy.keyed). Local,
+  // non-normative extensions in the pruneTopic family — SUB wire format and
+  // topicSchemaHash are unchanged.
+  // pruneSuperseded: delete, at or below min(uptoRowid, every onEntry
+  // cursor), rows superseded by a newer same-key row at or below uptoRowid,
+  // then tombstones left as the only row of their key (and, with
+  // supersedeOtherWriters, every other writer's rows). Allowed while "tail"
+  // subscribers are attached. At most maxRows (default 250, cap 10_000) rows
+  // per call. Rejects ERR_MISUSE on a non-keyed topic or bad arguments.
+  pruneSuperseded(
+    topic: Topic,
+    o: { uptoRowid: number; maxRows?: number; supersedeOtherWriters?: boolean },
+  ): Promise<{ prunedRows: number }>;
+  // Bounded newest-per-key page (keyed topics only) — for host-side state
+  // rebuild and parity. Never creates a cursor.
+  scanLatestPerKey(topic: Topic, o?: KeyedScanOptions): KeyedScanResult;
+  // Newest row of one key (keyed topics only), with its rowid — how a host
+  // finds its watermark (e.g. its commit key) for pruneSuperseded/selectors.
+  keyHead(topic: Topic, key: string): { entry: LogEntry; rowid: number } | null;
+  // Serving subscribers on the topic's built-in "tail" SUB group.
+  tailSubscriberCount(topic: Topic): number;
   // Bounded inspection (P21)
   scanEntries(topic: Topic, o?: ScanOptions): ScanResult;
   headOrder(topic: Topic): Order | null; // pin scan `through` / comparison heads
@@ -350,7 +385,7 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
 
     log(topic: Topic) {
       return {
-        append(kind: string, payload: JsonValue, o?: { ref?: EntryId }): Promise<EntryId> {
+        append(kind: string, payload: JsonValue, o?: { ref?: EntryId; key?: string }): Promise<EntryId> {
           // One asynchronous failure contract (proposals-v3.5 P11): every
           // data-dependent preflight failure — closed node, unknown topic,
           // encoding — rejects the returned Promise (SPEC §14 error carriage:
@@ -367,7 +402,19 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
           // topic is perfectly healthy: a silent, permanent, fail-closed drop.
           if (topics.has(topic) && topics.get(topic).policy.kind === "register")
             throw misuse(`raw append on register topic ${topic} — use register(topic) helpers`);
-          return core.append(topic, kind, payload, o?.ref ? { ref: o.ref } : undefined);
+          // Keyed append (host-guide §4.7): a key is mandatory on a keyed
+          // topic and meaningless elsewhere — both mismatches REJECT (a
+          // runtime-defined topic makes this data-dependent, P11), never
+          // throw, so the P33 caller hazard above does not grow.
+          const keyed = topics.has(topic) && topics.get(topic).policy.keyed !== undefined;
+          if (keyed && o?.key === undefined)
+            return Promise.reject(misuse(`append on keyed topic ${topic} requires a key`));
+          if (!keyed && o?.key !== undefined && topics.has(topic))
+            return Promise.reject(misuse(`append key requires a keyed topic (${topic})`));
+          const co: { ref?: EntryId; key?: string } = {};
+          if (o?.ref) co.ref = o.ref;
+          if (o?.key !== undefined) co.key = o.key;
+          return core.append(topic, kind, payload, co);
         },
       };
     },
@@ -592,6 +639,34 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
       return { retired, skipped };
     },
     scanEntries,
+    pruneSuperseded: (
+      topic: Topic,
+      o: { uptoRowid: number; maxRows?: number; supersedeOtherWriters?: boolean },
+    ) => core.pruneSuperseded(topic, o),
+    scanLatestPerKey: (topic: Topic, o: KeyedScanOptions = {}): KeyedScanResult => {
+      if (closed) throw misuse("node is closed");
+      topics.get(topic);
+      const limit = Math.min(Math.max(1, Math.floor(o.limit ?? SCAN_DEFAULT_LIMIT)), SCAN_MAX_LIMIT);
+      const after = o.afterRowid ?? 0;
+      if (!Number.isSafeInteger(after) || after < 0)
+        throw misuse("scanLatestPerKey: afterRowid must be a non-negative safe integer");
+      if (o.uptoRowid !== undefined && (!Number.isSafeInteger(o.uptoRowid) || o.uptoRowid < 0))
+        throw misuse("scanLatestPerKey: uptoRowid must be a non-negative safe integer");
+      const fetched = core.latestPerKeyPage(topic, o.uptoRowid ?? null, after, limit + 1);
+      const entries = fetched.slice(0, limit);
+      const complete = fetched.length <= limit;
+      const r: KeyedScanResult = { entries, complete };
+      if (!complete) r.nextAfterRowid = entries[entries.length - 1]!.rowid;
+      return r;
+    },
+    keyHead: (topic: Topic, key: string) => {
+      if (closed) throw misuse("node is closed");
+      return core.keyHead(topic, key);
+    },
+    tailSubscriberCount: (topic: Topic) => {
+      topics.get(topic);
+      return subs.tailSubscriberCount(topic);
+    },
     headOrder: (topic: Topic): Order | null => {
       if (closed) throw misuse("node is closed");
       topics.get(topic);

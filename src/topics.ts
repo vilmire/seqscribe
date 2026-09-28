@@ -57,6 +57,20 @@ export function validatePolicy(topic: Topic, p: TopicPolicy, authority?: Authori
 
   if (p.hintKeys !== undefined && p.hintKeys !== "plain" && p.hintKeys !== "hash")
     throw misuse(`bad hintKeys for ${topic}`);
+  if (p.keyed !== undefined) {
+    // Keyed append (host-guide §4.7): newest-per-key semantics are LOCAL
+    // storage policy — they license pruneSuperseded to delete this node's own
+    // rows — so they are confined to the shape where local deletion forks
+    // nobody: a subscribe-only (never log-replicated) durable append topic.
+    // Register topics already have a key model of their own (§11).
+    if (p.kind !== "append" || mode !== "full" || p.replication !== "subscribe-only")
+      throw misuse(
+        `keyed requires kind "append", retention "full" and replication "subscribe-only" (${topic})`,
+      );
+    const k = p.keyed as unknown;
+    const tk = typeof k === "object" && k !== null ? (k as { tombstoneKind?: unknown }).tombstoneKind : undefined;
+    if (typeof tk !== "string" || tk.length === 0) throw misuse(`bad keyed.tombstoneKind for ${topic}`);
+  }
   if (p.flushThrottleMs !== undefined && (!Number.isSafeInteger(p.flushThrottleMs) || p.flushThrottleMs < 0))
     throw misuse(`bad flushThrottleMs for ${topic}`);
 }

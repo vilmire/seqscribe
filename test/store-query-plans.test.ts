@@ -63,6 +63,27 @@ function seed(store: Store): void {
   });
 }
 
+// A keyed-append topic (host-guide §4.7): 40 keys rewritten 10 times each,
+// every 7th row a tombstone, two writers — so per-key runs, tombstones and
+// other-writer rows all exist for the keyed-query plans below.
+const KEYED = "session.k.chat";
+function seedKeyed(store: Store): void {
+  store.transaction(() => {
+    for (let i = 1; i <= 400; i++) {
+      store.insertEntry({
+        topic: KEYED,
+        writer: i % 5 === 0 ? "w2" : "w1",
+        seq: i,
+        hlc: { l: 2_000 + i, c: 0 },
+        kind: i % 7 === 0 ? "del" : "msg",
+        key: `m:${i % 40}`,
+        payload: { i, pad: "y".repeat(64) },
+        chain: `k${i}`,
+      });
+    }
+  });
+}
+
 function planOf(db: SqliteHandle, q: Captured): string {
   return db
     .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${q.sql}`, q.params)
@@ -82,6 +103,7 @@ describe("sq_log per-topic hot-path query plans", () => {
   const store = new Store(recordingHandle(inner, log));
   store.init("normal");
   seed(store);
+  seedKeyed(store);
   // Plans are checked both without and with ANALYZE statistics — a planner
   // that only behaves with stats would regress on every DB that never ran it.
   const variants: [string, () => void][] = [
@@ -111,6 +133,32 @@ describe("sq_log per-topic hot-path query plans", () => {
           const plan = planOf(inner, q);
           expect(plan, q.sql).not.toMatch(/TEMP B-TREE/);
           expect(plan, q.sql).toMatch(/sq_log_topic_rowid/);
+        }
+      });
+    }
+
+    // Keyed-append reads/prunes (latestPerKey SNAP + scanLatestPerKey,
+    // keyHead watermark lookup, pruneSuperseded's three candidate selects):
+    // every one is an index walk plus sq_log_key seeks — no TEMP B-TREE, and
+    // never a bare SCAN of sq_log.
+    const keyedPaths: [string, RegExp[], () => unknown][] = [
+      ["latestPerKeyPage(null)", [/sq_log_topic_rowid/, /sq_log_key/], () => store.latestPerKeyPage(KEYED, null, 0, 64)],
+      ["latestPerKeyPage(upto)", [/sq_log_topic_rowid/, /sq_log_key/], () => store.latestPerKeyPage(KEYED, 1_000, 100, 64)],
+      ["keyHead", [/sq_log_key/], () => store.keyHead(KEYED, "m:3")],
+      ["supersededRowids", [/sq_log_key/], () => store.supersededRowids(KEYED, 1_000, 1_100, 64)],
+      ["loneTombstoneRowids", [/sq_log_key/], () => store.loneTombstoneRowids(KEYED, "del", 1_000, 1_100, 64)],
+      ["otherWriterRowids", [/sq_log_topic_rowid/], () => store.otherWriterRowids(KEYED, "w1", 1_000, 64)],
+    ];
+    for (const [name, indexes, fn] of keyedPaths) {
+      it(`${name} uses its indexes with no TEMP B-TREE and no table scan (${variant})`, () => {
+        prepare();
+        const queries = capture(store, log, fn);
+        expect(queries.length).toBeGreaterThan(0);
+        for (const q of queries) {
+          const plan = planOf(inner, q);
+          expect(plan, q.sql).not.toMatch(/TEMP B-TREE/);
+          expect(plan, q.sql).not.toMatch(/SCAN (a|b|sq_log)(?! USING)/);
+          for (const ix of indexes) expect(plan, q.sql).toMatch(ix);
         }
       });
     }

@@ -70,7 +70,7 @@ type Seq      = number;   // ★per (topic, writer) stream, monotonic from 1, ga
 type Hlc      = { l: number; c: number };
 type EntryId  = [Topic, WriterId, Seq];
 type Order    = { l: number; c: number; writer: WriterId; seq: Seq };
-type Key      = string;   // register only, UTF-8 ≤512B
+type Key      = string;   // register, or keyed append (TopicPolicy.keyed); UTF-8 ≤512B
 ```
 
 - `seq`, `hlc.l`, `hlc.c` MUST be non-negative safe integers; `hlc.c` MUST be < 2^32 (stamping that would exceed it fails with `ERR_ENTRY_ENCODING` — a pathological-clock guard). Violations on receive: entry rejected + annotation.
@@ -87,7 +87,7 @@ type Key      = string;   // register only, UTF-8 ≤512B
 interface LogEntry {
   topic: Topic; writer: WriterId; seq: Seq; hlc: Hlc;
   kind: string;
-  key?: Key;                 // register only
+  key?: Key;                 // register, or keyed append (§14 TopicPolicy.keyed) — hashed
   causal?: [WriterId, Seq];  // register: last write the author observed for the key (§11)
   ref?: EntryId;             // semantic reference (e.g. owned-request origin) — hashed
   payload: JsonValue;        // JSON only; binary via reference strings
@@ -665,6 +665,13 @@ interface TopicPolicy {
     // hash of it. Legal on an append topic, where it enables the host-supplied
     // path only (append topics have no per-key index to derive from).
   flushThrottleMs?: number;
+  keyed?: {tombstoneKind: string};   // keyed append — a LOCAL storage extension
+    // (docs/host-guide.md §4.7), not a protocol change: legal only with kind "append" ∧
+    // retention "full" ∧ replication "subscribe-only"; every append MUST then carry a
+    // `key` (and a key on a non-keyed append topic is ERR_MISUSE). Keys are hashed into
+    // the chain exactly as register keys are (§4). NOT an input to topicSchemaHash (like
+    // retention/replication) — the SUB wire shape (§9 `tail` rows, §10) is unchanged,
+    // so peers need not agree on it.
 }
 // topicSchemaHash = sha256(JCS(N)) where N is exactly:
 //   { kind,
@@ -720,7 +727,9 @@ function createSeqscribe(opts: {
 interface SeqscribeNode {
   defineTopic(topic: Topic, policy: TopicPolicy): void;
   log(topic: Topic): { append(kind: string, payload: JsonValue,
-                              o?: {ref?: EntryId}): Promise<EntryId> };
+                              o?: {ref?: EntryId, key?: Key}): Promise<EntryId> };
+    // `key`: keyed append topics only, where it is mandatory (TopicPolicy.keyed);
+    // either mismatch REJECTS with ERR_MISUSE (never a synchronous throw).
   register(topic: Topic): RegisterHandle;
   onEntry(topic: Topic, consumer: string,
           cb: (e: LogEntry) => void | Promise<void>): Unsub;

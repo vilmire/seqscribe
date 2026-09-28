@@ -115,6 +115,31 @@ interface PruneTopicItem {
   reject: (e: unknown) => void;
 }
 
+// Keyed-append compaction (host-guide §4.7 `pruneSuperseded`). Serialized
+// through the queue like pruneTopic so the candidate selects and the DELETEs
+// see one consistent state and an append racing in the same batch is ordered
+// against them.
+interface PruneSupersededItem {
+  t: "pruneSuperseded";
+  topic: Topic;
+  uptoRowid: number;
+  maxRows: number;
+  supersedeOtherWriters: boolean;
+  resolve: (r: { prunedRows: number }) => void;
+  reject: (e: unknown) => void;
+}
+
+// pruneSuperseded's per-call bound when maxRows is omitted (one call is one
+// flush-transaction's worth of DELETEs — bounded so compaction never stalls
+// the append queue), and the clamp for an explicit maxRows. Like the §14.1
+// scan page bounds these bound a synchronous local operation, not a protocol
+// behavior, so they are deliberately not Constants.
+export const PRUNE_SUPERSEDED_DEFAULT_MAX_ROWS = 250;
+export const PRUNE_SUPERSEDED_MAX_ROWS_CAP = 10_000;
+// Page size for the whole-set keyed reads (latestPerKey / rowsAfter) that
+// build a SNAP body: each store call stays LIMIT-bounded.
+const KEYED_READ_PAGE = 500;
+
 type QueueItem =
   | AppendItem
   | ExternalItem
@@ -123,7 +148,8 @@ type QueueItem =
   | DirectiveItem
   | AdoptCutItem
   | RetireTopicItem
-  | PruneTopicItem;
+  | PruneTopicItem
+  | PruneSupersededItem;
 
 export interface RecoveryTarget {
   finalSeq: Seq;
@@ -375,6 +401,107 @@ export class LogCore {
     });
   }
 
+  // Keyed-append compaction (host-guide §4.7). Deletes, in one queue item:
+  //   (a) every row at or below the floor that a NEWER row of the same key at
+  //       or below `uptoRowid` supersedes;
+  //   (b) every tombstone (`keyed.tombstoneKind`) at or below the floor that
+  //       is then the only row of its key at or below `uptoRowid`;
+  //   (c) with supersedeOtherWriters, every row at or below the floor authored
+  //       by a writer other than this node's (a writer change: the new
+  //       writer's base frame has rewritten every live key).
+  // floor = min(uptoRowid, every registered onEntry cursor) — a row an
+  // onEntry consumer has not read is never deleted. Supersession is judged at
+  // `uptoRowid` (the host's commit watermark): a row newer than it never
+  // causes an older row to be deleted, so the last committed version of a key
+  // an in-flight frame is rewriting survives. Unlike pruneTopic this is
+  // ALLOWED while "tail" subscribers are attached: a keyed topic's SNAP is
+  // built newest-per-key, so no reader ever re-reads a superseded row. At
+  // most `maxRows` rows go per call — a result equal to maxRows means more
+  // may remain.
+  pruneSuperseded(
+    topic: Topic,
+    o: { uptoRowid: number; maxRows?: number; supersedeOtherWriters?: boolean },
+  ): Promise<{ prunedRows: number }> {
+    try {
+      if (this.closed) throw new SeqscribeError("ERR_MISUSE", "node is closed");
+      const entry = this.topics.get(topic); // ERR_UNKNOWN_TOPIC before enqueue
+      if (entry.policy.keyed === undefined)
+        throw misuse(`pruneSuperseded: requires a keyed topic (${topic})`);
+      if (!Number.isSafeInteger(o?.uptoRowid) || o.uptoRowid < 0)
+        throw misuse(`pruneSuperseded: uptoRowid must be a non-negative safe integer`);
+      if (o.maxRows !== undefined && (!Number.isSafeInteger(o.maxRows) || o.maxRows < 1))
+        throw misuse(`pruneSuperseded: maxRows must be a positive safe integer`);
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    return new Promise((resolve, reject) => {
+      this.push({
+        t: "pruneSuperseded",
+        topic,
+        uptoRowid: o.uptoRowid,
+        maxRows: Math.min(o.maxRows ?? PRUNE_SUPERSEDED_DEFAULT_MAX_ROWS, PRUNE_SUPERSEDED_MAX_ROWS_CAP),
+        supersedeOtherWriters: o.supersedeOtherWriters === true,
+        resolve,
+        reject,
+      });
+    });
+  }
+
+  // ---- keyed-append reads (host-guide §4.7) ----
+  // Keyed topics only; ERR_MISUSE otherwise. A register topic also carries
+  // keys, but its current value is a causal fold (§11), never "newest row".
+
+  private assertKeyed(topic: Topic, op: string): void {
+    if (this.topics.get(topic).policy.keyed === undefined) throw misuse(`${op}: requires a keyed topic (${topic})`);
+  }
+
+  // One rowid-ordered page of the newest row per key (see
+  // Store.latestPerKeyPage) — the bounded read behind scanLatestPerKey.
+  latestPerKeyPage(
+    topic: Topic,
+    uptoRowid: number | null,
+    afterRowid: number,
+    limit: number,
+  ): { entry: LogEntry; rowid: number }[] {
+    this.assertKeyed(topic, "latestPerKey");
+    return this.store.latestPerKeyPage(topic, uptoRowid, afterRowid, limit);
+  }
+
+  // The whole newest-per-key set at or below `uptoRowid` (null = all rows),
+  // rowid order — a keyed "tail" SNAP body. Read page by page; the result is
+  // the live state (one row per key), never the superseded history.
+  latestPerKey(topic: Topic, uptoRowid: number | null): { entry: LogEntry; rowid: number }[] {
+    this.assertKeyed(topic, "latestPerKey");
+    const out: { entry: LogEntry; rowid: number }[] = [];
+    let after = 0;
+    for (;;) {
+      const page = this.store.latestPerKeyPage(topic, uptoRowid, after, KEYED_READ_PAGE);
+      for (const r of page) out.push(r);
+      if (page.length < KEYED_READ_PAGE) return out;
+      after = page[page.length - 1]!.rowid;
+    }
+  }
+
+  // Every row strictly after `afterRowid`, rowid order (the in-flight suffix
+  // above a keyed topic's watermark). Any full-retention topic.
+  rowsAfter(topic: Topic, afterRowid: number): { entry: LogEntry; rowid: number }[] {
+    if (this.topics.get(topic).policy.retention.mode !== "full")
+      throw misuse(`rowsAfter: requires retention "full" (${topic})`);
+    const out: { entry: LogEntry; rowid: number }[] = [];
+    let after = afterRowid;
+    for (;;) {
+      const page = this.store.entriesForTopicFromRowid(topic, after, KEYED_READ_PAGE);
+      for (const r of page) out.push(r);
+      if (page.length < KEYED_READ_PAGE) return out;
+      after = page[page.length - 1]!.rowid;
+    }
+  }
+
+  keyHead(topic: Topic, key: string): { entry: LogEntry; rowid: number } | null {
+    this.assertKeyed(topic, "keyHead");
+    return this.store.keyHead(topic, key) ?? null;
+  }
+
   recoveryTarget(topic: Topic, writer: WriterId): RecoveryTarget | undefined {
     return this.recoveries.get(`${topic} ${writer}`);
   }
@@ -590,7 +717,8 @@ export class LogCore {
           else if (item.t === "directive") this.processDirective(item, settle, anomalies);
           else if (item.t === "adopt") this.processAdopt(item, settle);
           else if (item.t === "retireTopic") this.processRetireTopic(item, settle);
-          else this.processPruneTopic(item, settle);
+          else if (item.t === "pruneTopic") this.processPruneTopic(item, settle);
+          else this.processPruneSuperseded(item, settle);
         }
         this.store.metaSet(HLC_META_KEY, JSON.stringify(this.hlcState));
       });
@@ -937,6 +1065,18 @@ export class LogCore {
     // meant a transcript topic with a permanently open viewer was never pruned
     // at all: measured 2026-09-28, 160k rows / 2.3 GB on one topic whose
     // siblings sat at the host's 600-row cap.
+    // A keyed topic's SNAP is newest-per-key over the WHOLE topic, not a
+    // window: any row pruneTopic deletes may be a key's live value, so while a
+    // tail subscriber is attached it refuses any deletion at all
+    // (pruneSuperseded is the keyed topic's compaction).
+    if (belowRowid >= 1 && entry.policy.keyed !== undefined && this.hasActiveSubscriber?.(topic)) {
+      settle.push(() =>
+        item.reject(
+          misuse(`pruneTopic: keyed topic has an active tail subscriber — use pruneSuperseded (${topic})`),
+        ),
+      );
+      return;
+    }
     if (belowRowid >= 1 && this.hasActiveSubscriber?.(topic)) {
       const windowFloor = this.store.rowidAtTailOffset(topic, FULL_TAIL_DEFAULT);
       if (windowFloor === null || belowRowid >= windowFloor) {
@@ -959,6 +1099,38 @@ export class LogCore {
     // nothing here for vectorsCache to invalidate.
     const prunedRows = this.store.deleteLogRowsUpToRowid(topic, belowRowid, hlcBefore);
     settle.push(() => item.resolve({ prunedRows }));
+  }
+
+  // pruneSuperseded's flush-handler half — see pruneSuperseded() for the
+  // semantics. Order inside the one transaction: (c), then (a), then (b), so
+  // (b)'s "only row of its key" probe sees the other two steps' deletions;
+  // each step takes what is left of the maxRows budget.
+  private processPruneSuperseded(item: PruneSupersededItem, settle: (() => void)[]): void {
+    const { topic } = item;
+    const keyed = this.topics.get(topic).policy.keyed;
+    if (keyed === undefined) {
+      settle.push(() => item.reject(misuse(`pruneSuperseded: requires a keyed topic (${topic})`)));
+      return;
+    }
+    let floor = item.uptoRowid;
+    for (const c of this.store.cursorsForTopic(topic)) floor = Math.min(floor, c.lastRowid);
+    let budget = item.maxRows;
+    let pruned = 0;
+    const drop = (rowids: number[]) => {
+      this.store.deleteLogRowids(topic, rowids);
+      budget -= rowids.length;
+      pruned += rowids.length;
+    };
+    if (floor >= 1) {
+      if (item.supersedeOtherWriters && budget > 0)
+        drop(this.store.otherWriterRowids(topic, this.writerId, floor, budget));
+      if (budget > 0) drop(this.store.supersededRowids(topic, floor, item.uptoRowid, budget));
+      if (budget > 0)
+        drop(this.store.loneTombstoneRowids(topic, keyed.tombstoneKind, floor, item.uptoRowid, budget));
+    }
+    // Only sq_log rows move — stream heads (contig/chain) and hence vectors()
+    // are untouched, exactly as for pruneTopic.
+    settle.push(() => item.resolve({ prunedRows: pruned }));
   }
 
   private recoveryIngest(

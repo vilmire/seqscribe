@@ -265,6 +265,121 @@ export class Store {
     return rows.map(rowToEntry);
   }
 
+  // ---- keyed append topics (TopicPolicy.keyed, host-guide §4.7) ----
+  //
+  // Every query below is an index walk: the outer loop names its index
+  // (sq_log_topic_rowid for rowid-ordered pages, sq_log_key for per-key
+  // work), and the correlated per-key probe is a seek on sq_log_key, whose
+  // trailing rowid makes "a newer row of this key at or below W" a range
+  // check inside one (topic, key) run. sq_log_key is PARTIAL (key IS NOT
+  // NULL); every probe carries an explicit `key IS NOT NULL` so the planner
+  // can prove the index usable without relying on implied-not-null
+  // inference. No query here sorts (no TEMP B-TREE) or materializes a topic:
+  // callers page with LIMIT and resume by rowid.
+
+  // One page of the newest row per key, in rowid order, restricted to rows
+  // with afterRowid < rowid <= uptoRowid (null = no upper bound). A row is
+  // "newest" when no row of the same key exists in (rowid, uptoRowid] — so
+  // supersession is judged AT the watermark: a row newer than uptoRowid never
+  // hides an older one. Key-less rows (never produced on a keyed topic) are
+  // their own key and always qualify. Superseded rows are skipped inside the
+  // index walk (their key column is read, their payload is not parsed).
+  latestPerKeyPage(
+    topic: Topic,
+    uptoRowid: number | null,
+    afterRowid: number,
+    limit: number,
+  ): { entry: LogEntry; rowid: number }[] {
+    const upto = uptoRowid ?? Number.MAX_SAFE_INTEGER;
+    return this.db
+      .all<RawLogRow>(
+        `SELECT a.* FROM sq_log AS a INDEXED BY sq_log_topic_rowid
+         WHERE a.topic = ? AND a.rowid > ? AND a.rowid <= ?
+           AND (a.key IS NULL OR NOT EXISTS (
+             SELECT 1 FROM sq_log AS b INDEXED BY sq_log_key
+             WHERE b.topic = ? AND b.key IS NOT NULL AND b.key = a.key
+               AND b.rowid > a.rowid AND b.rowid <= ?))
+         ORDER BY a.rowid LIMIT ?`,
+        [topic, afterRowid, upto, topic, upto, limit],
+      )
+      .map(rowToEntry);
+  }
+
+  // Newest row of one key (any rowid), or undefined. A single descending
+  // seek on sq_log_key — how a host finds its commit watermark W.
+  keyHead(topic: Topic, key: string): { entry: LogEntry; rowid: number } | undefined {
+    const r = this.db.get<RawLogRow>(
+      `SELECT * FROM sq_log INDEXED BY sq_log_key
+       WHERE topic = ? AND key IS NOT NULL AND key = ? ORDER BY rowid DESC LIMIT 1`,
+      [topic, key],
+    );
+    return r ? rowToEntry(r) : undefined;
+  }
+
+  // pruneSuperseded (a): rows at or below `floorRowid` that a NEWER row of
+  // the same key at or below `uptoRowid` supersedes. Walks sq_log_key in
+  // (key, rowid) order — index-only for the candidate AND the probe.
+  supersededRowids(topic: Topic, floorRowid: number, uptoRowid: number, limit: number): number[] {
+    return this.db
+      .all<{ rowid: number }>(
+        `SELECT a.rowid AS rowid FROM sq_log AS a INDEXED BY sq_log_key
+         WHERE a.topic = ? AND a.key IS NOT NULL AND a.rowid <= ?
+           AND EXISTS (
+             SELECT 1 FROM sq_log AS b INDEXED BY sq_log_key
+             WHERE b.topic = ? AND b.key IS NOT NULL AND b.key = a.key
+               AND b.rowid > a.rowid AND b.rowid <= ?)
+         LIMIT ?`,
+        [topic, floorRowid, topic, uptoRowid, limit],
+      )
+      .map((r) => r.rowid);
+  }
+
+  // pruneSuperseded (b): tombstones (`kind = tombstoneKind`) at or below
+  // `floorRowid` that are the ONLY row of their key at or below `uptoRowid`.
+  // An older row of the key still present (e.g. held by a consumer cursor)
+  // keeps its tombstone — deleting it would resurrect that row. Rows of the
+  // key newer than uptoRowid (an uncommitted re-creation) do not block.
+  loneTombstoneRowids(
+    topic: Topic,
+    tombstoneKind: string,
+    floorRowid: number,
+    uptoRowid: number,
+    limit: number,
+  ): number[] {
+    return this.db
+      .all<{ rowid: number }>(
+        `SELECT a.rowid AS rowid FROM sq_log AS a INDEXED BY sq_log_key
+         WHERE a.topic = ? AND a.key IS NOT NULL AND a.rowid <= ? AND a.kind = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM sq_log AS b INDEXED BY sq_log_key
+             WHERE b.topic = ? AND b.key IS NOT NULL AND b.key = a.key
+               AND b.rowid <> a.rowid AND b.rowid <= ?)
+         LIMIT ?`,
+        [topic, floorRowid, tombstoneKind, topic, uptoRowid, limit],
+      )
+      .map((r) => r.rowid);
+  }
+
+  // pruneSuperseded with supersedeOtherWriters: rows at or below `floorRowid`
+  // authored by any writer other than `writer`, oldest first.
+  otherWriterRowids(topic: Topic, writer: WriterId, floorRowid: number, limit: number): number[] {
+    return this.db
+      .all<{ rowid: number }>(
+        `SELECT rowid FROM sq_log INDEXED BY sq_log_topic_rowid
+         WHERE topic = ? AND rowid <= ? AND writer <> ? ORDER BY rowid LIMIT ?`,
+        [topic, floorRowid, writer, limit],
+      )
+      .map((r) => r.rowid);
+  }
+
+  // Delete exactly these rows of `topic` — rowids the caller just selected in
+  // the same transaction, so each exists (the count is not read from
+  // run().changes, which the wasm/DO adapters do not report).
+  deleteLogRowids(topic: Topic, rowids: number[]): void {
+    for (const rowid of rowids) this.db.run("DELETE FROM sq_log WHERE rowid = ? AND topic = ?", [rowid, topic]);
+    if (rowids.length > 0) this.logCounts.delete(topic); // recount lazily
+  }
+
   // Total-order iteration (§1): entries strictly after `after` in
   // (hlc_l, hlc_c, writer, seq) order; after=null starts from the beginning.
   entriesAfterOrder(topic: Topic, after: Order | null, limit: number): LogEntry[] {

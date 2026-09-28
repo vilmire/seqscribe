@@ -91,6 +91,8 @@ export {
   type NodeStats,
   type ScanOptions,
   type ScanResult,
+  type KeyedScanOptions,
+  type KeyedScanResult,
 } from "./node.js";
 export type { TopicSyncCounters } from "./sync.js";
 export type { SubStats, SubResyncReason, TailSource, TailSnapshotSelector } from "./subs.js";

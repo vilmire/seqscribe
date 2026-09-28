@@ -219,6 +219,17 @@ export interface TailSource {
   readonly retention: "ring" | "full";
   readonly defaultLimit: number;
   page(beforeRowid: number | null, limit: number): { entry: LogEntry; rowid: number }[];
+  // Keyed-append topics (TopicPolicy.keyed, host-guide §4.7). For a keyed
+  // topic the default SNAP is latestPerKey(null) — the whole newest-per-key
+  // set, NOT the last `defaultLimit` rows — and a selector typically returns
+  // latestPerKey(W) followed by rowsAfter(W), W being its own commit
+  // watermark (keyHead of its commit key). latestPerKey/keyHead throw
+  // ERR_MISUSE on a non-keyed topic; rowsAfter on a ring topic (both are a
+  // selector fault → default SNAP).
+  readonly keyed: boolean;
+  latestPerKey(uptoRowid: number | null): { entry: LogEntry; rowid: number }[];
+  rowsAfter(rowid: number): { entry: LogEntry; rowid: number }[];
+  keyHead(key: string): { entry: LogEntry; rowid: number } | null;
 }
 
 // Host hook (extension): chooses which rows a "tail" SNAP carries for a topic.
@@ -408,6 +419,17 @@ export class SubHub {
   // case. `groups` has no topic-keyed index (it's keyed by `view\0params`),
   // so this is a linear scan — acceptable here: called once per candidate
   // topic in a boot-time sweep, not per-request.
+  // Serving subscribers of `topic`'s built-in "tail" group (0 when none) —
+  // host-guide §4.7 `tailSubscriberCount`. Unlike hasActiveSubscribersFor it
+  // does not count a register topic's "register" group.
+  tailSubscriberCount(topic: Topic): number {
+    const group = this.groups.get(this.ringKey(topic));
+    if (!group) return 0;
+    let n = 0;
+    for (const inGroup of group.subs.values()) n += inGroup.size;
+    return n;
+  }
+
   hasActiveSubscribersFor(topic: Topic): boolean {
     for (const group of this.groups.values()) {
       if (group.ringTopic === topic && group.subs.size > 0) return true;
@@ -480,12 +502,18 @@ export class SubHub {
         mode === "ring"
           ? (policy.retention as { size?: number }).size ?? this.deps.constants.RING_DEFAULT
           : FULL_TAIL_DEFAULT;
+      // A keyed topic's state is its newest row per key, which no fixed
+      // window of recent rows can hold once live keys outnumber the window —
+      // its default SNAP is the newest-per-key set instead (host-guide §4.7).
+      const keyed = policy.keyed !== undefined;
       const defaultRows =
         mode === "ring"
           ? () => this.deps.core.ringTail(topic)
-          : () => this.deps.core.fullTail(topic, FULL_TAIL_DEFAULT);
+          : keyed
+            ? () => this.deps.core.latestPerKey(topic, null).map((r) => r.entry)
+            : () => this.deps.core.fullTail(topic, FULL_TAIL_DEFAULT);
       const rowsProvider = () =>
-        (this.selectTail(topic, mode, defaultLimit) ?? defaultRows()).map((e) => this.ringRow(e));
+        (this.selectTail(topic, mode, defaultLimit, keyed) ?? defaultRows()).map((e) => this.ringRow(e));
       const group: Group = {
         key: this.ringKey(topic),
         viewName: null,
@@ -527,7 +555,12 @@ export class SubHub {
     return group;
   }
 
-  private selectTail(topic: Topic, mode: "ring" | "full", defaultLimit: number): LogEntry[] | null {
+  private selectTail(
+    topic: Topic,
+    mode: "ring" | "full",
+    defaultLimit: number,
+    keyed: boolean,
+  ): LogEntry[] | null {
     const sel = this.tailSelector;
     if (!sel) return null;
     const core = this.deps.core;
@@ -538,6 +571,10 @@ export class SubHub {
           retention: mode,
           defaultLimit,
           page: (beforeRowid, limit) => core.tailPage(topic, mode === "ring", beforeRowid, limit),
+          keyed,
+          latestPerKey: (uptoRowid) => core.latestPerKey(topic, uptoRowid),
+          rowsAfter: (rowid) => core.rowsAfter(topic, rowid),
+          keyHead: (key) => core.keyHead(topic, key),
         }) ?? null
       );
     } catch {
