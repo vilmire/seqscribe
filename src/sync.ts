@@ -17,8 +17,10 @@ import type {
   MsgProbeRes,
   MsgSnap,
   MsgSnapshot,
+  MsgTruncated,
   MsgWant,
 } from "./messages.js";
+import type { AckRecorder, RetentionStats } from "./retention.js";
 import { Session, type PeerHandleExt } from "./session.js";
 import type { DirectiveHub } from "./directives.js";
 import type { FinalityHub } from "./finality.js";
@@ -95,6 +97,9 @@ interface PeerState {
   // capacity-aware pump into batched ENTRIES pushes
   dirty: Map<string, { topic: Topic; writer: WriterId; readyAt: number }>;
   pumpTimer: unknown;
+  // streams this proto < 3 peer WANTed below our retention floor — the
+  // floor_unservable anomaly fires once per stream per session (§4.8)
+  unservable: Set<string>;
 }
 
 export interface SyncEngineOpts {
@@ -128,6 +133,8 @@ export class SyncEngine {
   private subHub: SubHub | null = null;
   private directiveHub: DirectiveHub | null = null;
   private snapshotHub: SnapshotHub | null = null;
+  private acks: AckRecorder | null = null;
+  private retention: RetentionStats | null = null;
 
   constructor(opts: SyncEngineOpts) {
     this.o = opts;
@@ -165,6 +172,13 @@ export class SyncEngine {
         return this.subHub.subscribe(ps.session, o);
     }
     throw new SeqscribeError("ERR_MISUSE", `no open session for peer ${peerId}`);
+  }
+
+  // Acknowledged retention (host-guide §4.8): HAVE rounds feed the ack
+  // recorder; TRUNCATED service is counted per topic.
+  setRetention(acks: AckRecorder, stats: RetentionStats): void {
+    this.acks = acks;
+    this.retention = stats;
   }
 
   setSnapshotHub(hub: SnapshotHub): void {
@@ -253,6 +267,7 @@ export class SyncEngine {
       known: new Map(),
       dirty: new Map(),
       pumpTimer: null,
+      unservable: new Set(),
     };
     this.peers.set(session, ps);
     return {
@@ -456,6 +471,16 @@ export class SyncEngine {
   }
 
   private processPeerVectors(ps: PeerState, vectors: HaveVectors): void {
+    // §4.8: a completed round is the peer's own statement of its committed
+    // stream heads — record it as the peer node's acknowledgment (mutual-full
+    // topics only: nothing else is the peer's to acknowledge)
+    const node = ps.session.peerNode();
+    if (this.acks && node !== null) {
+      const mutual: HaveVectors = {};
+      for (const [topic, v] of Object.entries(vectors))
+        if (this.o.topics.has(topic) && ps.session.mutualFull(topic)) mutual[topic] = v;
+      this.acks.record(node, mutual, this.o.clock(), ps.session.proto());
+    }
     for (const [topic, v] of Object.entries(vectors)) {
       if (!this.o.topics.has(topic)) continue;
       if (!ps.session.mutualFull(topic)) continue;
@@ -542,6 +567,15 @@ export class SyncEngine {
       const head = this.o.core.getStream(d.topic, d.writer);
       const known = ps.known.get(key) ?? 0;
       if (known >= head.contigSeq) {
+        ps.dirty.delete(key);
+        continue;
+      }
+      // §4.8: a peer below our retention floor cannot apply anything we still
+      // hold — pushing rows above the floor would only park them in its
+      // sq_pending (forever, for a proto < 3 peer). Its own WANT gets
+      // TRUNCATED (or the empty completion) instead.
+      const floor = this.o.core.floorOf(d.topic, d.writer);
+      if (floor !== null && known < floor.seq) {
         ps.dirty.delete(key);
         continue;
       }
@@ -667,6 +701,9 @@ export class SyncEngine {
       case "PROBE":
         this.serveProbe(ps, m);
         break;
+      case "TRUNCATED":
+        this.onTruncated(ps, m);
+        break;
       case "PROBE_RES": {
         const cb = ps.probes.get(`${m.topic} ${m.writer}`);
         if (cb) cb(m);
@@ -774,6 +811,11 @@ export class SyncEngine {
     }
     const head = this.o.core.getStream(m.topic, m.writer);
     const toSeq = head.contigSeq; // captured at processing — stable completion point
+    const floor = this.o.core.floorOf(m.topic, m.writer);
+    if (floor !== null && m.fromSeq <= floor.seq) {
+      this.serveBelowFloor(ps, m, floor, toSeq);
+      return;
+    }
     if (m.fromSeq > toSeq) {
       ps.session.sendData((mid) => ({
         t: "ENTRIES",
@@ -825,6 +867,72 @@ export class SyncEngine {
       this.noteThroughput(m.topic, ps.session.peerId, batch.length, bytes, "served");
       from = last.seq + 1;
     }
+  }
+
+  // §4.8: a WANT at or below this node's retention floor. A proto ≥ 3 peer
+  // gets TRUNCATED (it advances past the floor and re-WANTs above it). An
+  // older peer cannot parse TRUNCATED, so it gets the empty `done` completion
+  // it has always understood: its P22 non-progress rule then parks the stream
+  // until the next HAVE round re-drives it — one WANT per ANTI_ENTROPY_MS, no
+  // spin — and it catches up once it upgrades or reaches a peer that still
+  // holds the range. Never a partial serve from above the floor: those
+  // entries would sit in the requester's sq_pending forever.
+  private serveBelowFloor(ps: PeerState, m: MsgWant, floor: { seq: Seq; chain: string }, toSeq: Seq): void {
+    if (ps.session.proto() >= 3) {
+      const res: MsgTruncated = {
+        t: "TRUNCATED",
+        req: m.req,
+        topic: m.topic,
+        writer: m.writer,
+        floorSeq: floor.seq,
+        floorChain: floor.chain,
+      };
+      ps.session.sendControl(res);
+      this.retention?.bump(m.topic, "truncatedServed");
+      return;
+    }
+    ps.session.sendData((mid) => ({
+      t: "ENTRIES",
+      mid,
+      req: m.req,
+      topic: m.topic,
+      writer: m.writer,
+      fromSeq: m.fromSeq,
+      toSeq,
+      entries: [],
+      done: true,
+    }));
+    this.retention?.bump(m.topic, "truncatedUnservable");
+    const key = `${m.topic}\u0000${m.writer}`;
+    if (!ps.unservable.has(key)) {
+      ps.unservable.add(key);
+      this.o.emitAnomaly({ kind: "floor_unservable", topic: m.topic, writer: m.writer, peerId: ps.session.peerId });
+    }
+  }
+
+  // Requester side of §4.8. Accepted only as the answer to OUR active WANT
+  // for that stream, only for a floor at or above what we asked for and not
+  // beyond the head the peer itself advertised; anything else just completes
+  // the WANT (the next HAVE round re-drives the stream).
+  private onTruncated(ps: PeerState, m: MsgTruncated): void {
+    if (!ps.session.mutualFull(m.topic)) return;
+    const want = ps.activeWants.get(m.req);
+    if (!want || want.topic !== m.topic || want.writer !== m.writer) return;
+    ps.session.satisfyRequest(`WANT:${m.req}`);
+    const peerHead = ps.known.get(`${m.topic}\u0000${m.writer}`) ?? 0;
+    if (m.floorSeq < want.fromSeq || m.floorSeq > peerHead) {
+      this.finishWant(ps, m.req);
+      return;
+    }
+    void this.o.core
+      .adoptFloor(m.topic, m.writer, m.floorSeq, m.floorChain)
+      .catch(() => "refused" as const)
+      .then((r) => {
+        this.finishWant(ps, m.req);
+        if (r === "refused" || ps.session.state() !== "ready") return;
+        if (this.o.core.getStream(m.topic, m.writer).contigSeq < peerHead)
+          this.queueWant(ps, m.topic, m.writer);
+      });
   }
 
   // ---- data dispatch ----

@@ -14,6 +14,14 @@ import { FinalityHub } from "./finality.js";
 import { LogCore } from "./log.js";
 import { ArchiveHub } from "./archive.js";
 import { RegisterHub } from "./register.js";
+import {
+  AckRecorder,
+  RetentionStats,
+  ackedRetentionRefusal,
+  type AckedPruneOptions,
+  type AckedPruneResult,
+  type TopicRetentionCounters,
+} from "./retention.js";
 import { SnapshotHub } from "./snapshot.js";
 import { Store } from "./store.js";
 import { SubHub, type SubStats, type TailSnapshotSelector } from "./subs.js";
@@ -27,6 +35,7 @@ import type {
   BeaconReport,
   BeaconTransport,
   Channel,
+  HaveVectors,
   CreateOpts,
   EntryId,
   JsonValue,
@@ -103,6 +112,11 @@ export interface NodeStats {
       // (interval, not cumulative; applyRejects above stays cumulative).
       // "hot and busy" is now distinguishable from P22's "hot and stuck".
       sync: TopicSyncCounters;
+      // Acknowledged retention (host-guide §4.8) — present on topics it
+      // applies to (full-sync, full-retention, non-keyed append). Cumulative
+      // counters since start plus two gauges: streams holding a retention
+      // floor, and peer nodes whose acknowledgments are recorded.
+      retention?: TopicRetentionCounters & { floorStreams: number; ackNodes: number };
     }
   >;
   peers: {
@@ -184,6 +198,22 @@ export interface SeqscribeNodeExt extends SeqscribeNode {
   // housekeeping — no signed authority, no cross-peer canonical state, same
   // spirit as retireTopic's own doc comment.
   pruneTopic(topic: Topic, o: { olderThanMs?: number; keepNewest?: number }): Promise<{ prunedRows: number }>;
+  // Acknowledged retention for a FULL-SYNC append topic (host-guide §4.8):
+  // delete, per stream, the oldest rows that every included member has
+  // acknowledged holding (their HAVE rounds, recorded durably), that are older
+  // than olderThanMs and that every onEntry consumer has read; record the new
+  // retention floor so a peer still below it recovers with TRUNCATED rather
+  // than a gap. A member silent longer than maxLagMs stops pinning. Bounded
+  // per call (maxRows); `more` says call again. Rejects ERR_MISUSE on a
+  // register, keyed, non-full-sync or non-"full" topic, or bad arguments.
+  pruneAcked(topic: Topic, o: AckedPruneOptions): Promise<AckedPruneResult>;
+  // This node's retention floor per stream (rows at or below are not held).
+  retentionFloors(topic: Topic): Record<WriterId, Seq>;
+  // Record acknowledgments learned out of band (e.g. a Beacon report) exactly
+  // as a HAVE round from `node` would: `vectors` is that node's own committed
+  // head vector, `at` when it was true. Only feed sources you would trust to
+  // drive deletion — an inflated ack lets pruneAcked delete rows that node lacks.
+  noteAcks(node: WriterId, vectors: HaveVectors, o?: { at?: number }): void;
   // Keyed-append housekeeping (host-guide §4.7; TopicPolicy.keyed). Local,
   // non-normative extensions in the pruneTopic family — SUB wire format and
   // topicSchemaHash are unchanged.
@@ -263,6 +293,7 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
     for (const cb of anomalyListeners) cb(a);
   };
 
+  const retention = new RetentionStats();
   const core = new LogCore({
     store,
     topics,
@@ -271,7 +302,9 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
     timers,
     constants,
     emitAnomaly,
+    retention,
   });
+  const acks = new AckRecorder(store, topics, opts.writerId);
 
   const sync = new SyncEngine({
     core,
@@ -283,9 +316,17 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
     clock,
     emitAnomaly,
   });
+  sync.setRetention(acks, retention);
 
   const consumers = new ConsumerHub({ store, topics, timers, constants, clock });
   const views = new ViewHub({ store, topics, timers, constants, rng, emitAnomaly });
+  // §4.8: a stream advanced past a peer's retention floor never delivered the
+  // entries below it — a view folding the topic is incomplete, the same state
+  // §7.8 names for a snapshot bootstrap without the view's state.
+  anomalyListeners.add((a) => {
+    if (a.kind !== "floor_adopted" || a.topic === undefined) return;
+    for (const v of views.listForTopic(a.topic)) views.markBootstrapPartial(v.name);
+  });
   const finalityHub = new FinalityHub({
     core,
     store,
@@ -583,6 +624,18 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
           wantRoundsServed: 0,
         },
       };
+      if (ackedRetentionRefusal(topics, topic) === null) {
+        out.topics[topic]!.retention = {
+          ...(retention.get(topic) ?? {
+            prunedRows: 0,
+            floorsAdopted: 0,
+            truncatedServed: 0,
+            truncatedUnservable: 0,
+          }),
+          floorStreams: store.floorsForTopic(topic).length,
+          ackNodes: store.ackNodes(topic).length,
+        };
+      }
     }
     return out;
   };
@@ -611,6 +664,26 @@ export function createSeqscribe(opts: CreateOpts): SeqscribeNodeExt {
     retireTopic: (topic: Topic) => core.retireTopic(topic),
     pruneTopic: (topic: Topic, o: { olderThanMs?: number; keepNewest?: number }) =>
       core.pruneTopic(topic, o),
+    pruneAcked: async (topic: Topic, o: AckedPruneOptions): Promise<AckedPruneResult> => {
+      const r = await core.pruneAcked(topic, o);
+      // an excluded/lagging node may just have been forgotten (its ack rows
+      // deleted) — drop its memo so its next HAVE re-records instead of being
+      // suppressed as unchanged (at worst one redundant upsert)
+      if (!o.dryRun) for (const m of r.members) if (m.excluded !== null) acks.forget(topic, m.node);
+      return r;
+    },
+    retentionFloors: (topic: Topic): Record<WriterId, Seq> => {
+      if (closed) throw misuse("node is closed");
+      topics.get(topic);
+      const out: Record<WriterId, Seq> = {};
+      for (const f of store.floorsForTopic(topic)) out[f.writer] = f.seq;
+      return out;
+    },
+    noteAcks: (node: WriterId, vectors: HaveVectors, o?: { at?: number }) => {
+      if (closed) throw misuse("node is closed");
+      assertWriter(node);
+      acks.record(node, vectors, o?.at ?? clock(), null);
+    },
     gcWriters: async (o: { topicPrefix: string; idleForMs: number; isIdle: (topic: Topic) => boolean }) => {
       if (closed) throw misuse("node is closed");
       const candidates = topics.list().filter((t) => t.startsWith(o.topicPrefix) && o.isIdle(t));

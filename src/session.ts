@@ -28,7 +28,11 @@ export const PROTO_MIN = 1;
 // protocol-violation closes. Accepting 1 is what keeps mixed-version fleets whole —
 // a proto-1 peer's ErrCode union has no ERR_PROTOCOL, so against such a peer those
 // sites keep emitting ERR_ENTRY_ENCODING exactly as v3.5–v3.7 specified.
-export const PROTO_MAX = 2;
+// proto 3 (host-guide §4.8, acknowledged retention): adds the TRUNCATED answer
+// to a WANT below the responder's retention floor. A responder sends it only to
+// a session that negotiated ≥ 3; a proto-1/2 requester below the floor gets the
+// empty `done` ENTRIES completion it has always understood instead.
+export const PROTO_MAX = 3;
 
 export type SessionState = "attached" | "ready" | "closed";
 
@@ -89,6 +93,10 @@ export class Session {
   readonly peerId: string;
   // negotiated protocol version; 1 until HELLO completes (P38)
   private protoNow = 1;
+  // the peer's self-declared node id from its HELLO (null until HELLO) — the
+  // identity acknowledged retention records the peer's HAVE vectors under
+  // (host-guide §4.8); peerId is a host label, not a protocol identity
+  private peerNodeNow: WriterId | null = null;
 
   readonly peerClass: "content" | "metadata";
   private grants: Record<Topic, "full" | "serve" | "none">;
@@ -338,6 +346,16 @@ export class Session {
   // proto ≥ 2 peers get the distinct `ERR_PROTOCOL`; proto-1 peers keep
   // `ERR_ENTRY_ENCODING`, whose union they actually have. Every protocol-violation
   // close site routes through here so the four of them cannot drift apart.
+  // Negotiated protocol version (1 until HELLO completes).
+  proto(): number {
+    return this.protoNow;
+  }
+
+  // The peer's HELLO `node` (its writer id), or null before HELLO.
+  peerNode(): WriterId | null {
+    return this.peerNodeNow;
+  }
+
   violationCode(): "ERR_PROTOCOL" | "ERR_ENTRY_ENCODING" {
     return this.protoNow >= 2 ? "ERR_PROTOCOL" : "ERR_ENTRY_ENCODING";
   }
@@ -457,6 +475,7 @@ export class Session {
     // it — this is the "negotiated way for peers to know the code is available"
     // that the v3.5/v3.6/v3.7 deferrals were waiting for.
     this.protoNow = proto;
+    this.peerNodeNow = m.node;
     this.peerGrants = m.grants;
     this.peerGrantsGen = m.grantsGen ?? 0;
     this.recomputeRefusals();

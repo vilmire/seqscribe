@@ -97,3 +97,12 @@ export {
 export type { TopicSyncCounters } from "./sync.js";
 export type { SubStats, SubResyncReason, TailSource, TailSnapshotSelector } from "./subs.js";
 export type { ConsumerInfo, ConsumerResetResult } from "./consume.js";
+export {
+  ACKED_PRUNE_DEFAULT_MAX_ROWS,
+  ACKED_PRUNE_MAX_ROWS_CAP,
+  type AckedPruneOptions,
+  type AckedPruneResult,
+  type AckedPruneWriter,
+  type AckedPruneMember,
+  type TopicRetentionCounters,
+} from "./retention.js";

@@ -3,7 +3,7 @@
 // different-content and mismatches route to the fork path), contig and
 // finality rules apply unchanged.
 
-import { validateEntry } from "./codec.js";
+import { assertWriter, validateEntry } from "./codec.js";
 import { SeqscribeError } from "./errors.js";
 import type { LogCore } from "./log.js";
 import type { Store } from "./store.js";
@@ -14,6 +14,12 @@ interface ExportHeader {
   seqscribe: "export/v1";
   topic: Topic;
   base: "genesis" | { order: FinalityCert["order"]; cut: FinalityCert["cut"] };
+  // Acknowledged retention (host-guide §4.8): per-stream retention floors of
+  // the exporting node — rows at or below them are not in the stream. An
+  // importer adopts them first so the rows above chain from floorChain
+  // instead of parking in sq_pending behind a gap. Absent when no floor
+  // exists (byte-identical to a pre-§4.8 export); pre-§4.8 importers ignore it.
+  floors?: Record<string, { seq: number; chain: string }>;
 }
 
 export interface ExportDeps {
@@ -42,6 +48,11 @@ export function exportTopic(deps: ExportDeps, topic: Topic): AsyncIterable<strin
       }
     }
     const header: ExportHeader = { seqscribe: "export/v1", topic, base };
+    const floors = deps.store.floorsForTopic(topic);
+    if (floors.length > 0) {
+      header.floors = {};
+      for (const f of floors) header.floors[f.writer] = { seq: f.seq, chain: f.chain };
+    }
     yield JSON.stringify(header);
     let afterRowid = 0;
     for (;;) {
@@ -74,6 +85,17 @@ export async function importTopic(
       if (h.topic !== topic)
         throw new SeqscribeError("ERR_MISUSE", `export is for topic ${h.topic}, not ${topic}`);
       header = h;
+      if (h.floors !== undefined && typeof h.floors === "object" && h.floors !== null) {
+        for (const [writer, f] of Object.entries(h.floors)) {
+          if (!Number.isSafeInteger(f?.seq) || f.seq < 1 || typeof f.chain !== "string") continue;
+          try {
+            assertWriter(writer); // charter (and __proto__) check, as for any entry's writer
+          } catch {
+            continue;
+          }
+          await deps.core.adoptFloor(topic, writer, f.seq, f.chain);
+        }
+      }
       continue;
     }
     const entry = validateEntry(JSON.parse(trimmed) as LogEntry, deps.constants);

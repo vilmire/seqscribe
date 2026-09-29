@@ -77,6 +77,21 @@ export interface MsgProbeRes {
   points: { seq: Seq; chain: string }[];
   unavailable?: { belowSeq: Seq };
 }
+// Acknowledged-retention bootstrap (host-guide §4.8, proto ≥ 3 only): the
+// answer to a WANT whose fromSeq is at or below the responder's retention
+// floor for the stream. Rows 1..floorSeq are no longer held anywhere the
+// responder is obliged to serve them from; the requester may advance its
+// contig to floorSeq and continue verifying chains from floorChain. Sent on
+// the control lane (it replaces the WANT's ENTRIES answer, so it satisfies the
+// WANT request) and never to a session that negotiated proto < 3.
+export interface MsgTruncated {
+  t: "TRUNCATED";
+  req: number;
+  topic: Topic;
+  writer: WriterId;
+  floorSeq: Seq;
+  floorChain: string;
+}
 export interface MsgFinality {
   t: "FINALITY";
   topic: Topic;
@@ -163,6 +178,7 @@ export type ControlMsg =
   | MsgWant
   | MsgProbe
   | MsgProbeRes
+  | MsgTruncated
   | MsgFinality
   | MsgWriterDirective
   | MsgSnapshotOffer
@@ -183,6 +199,7 @@ const ALL_TYPES: ReadonlySet<string> = new Set([
   "ENTRIES",
   "PROBE",
   "PROBE_RES",
+  "TRUNCATED",
   "FINALITY",
   "WRITER_DIRECTIVE",
   "SNAPSHOT_OFFER",
@@ -370,6 +387,13 @@ function validateShape(m: Rec): void {
       }
       break;
     }
+    case "TRUNCATED":
+      vInt(t, m.req, "req");
+      vTopic(t, m.topic, "topic");
+      vWriter(t, m.writer, "writer");
+      vPos(t, m.floorSeq, "floorSeq");
+      vChain(t, m.floorChain, "floorChain");
+      break;
     case "FINALITY": {
       // structural only — FinalityHub verifies signature/generation/order (§7)
       vTopic(t, m.topic, "topic");

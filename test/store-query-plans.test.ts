@@ -25,9 +25,12 @@ interface Captured {
   params: unknown[];
 }
 
-function recordingHandle(inner: SqliteHandle, log: Captured[]): SqliteHandle {
+function recordingHandle(inner: SqliteHandle, log: Captured[], runLog?: Captured[]): SqliteHandle {
   return {
-    run: (sql, params) => inner.run(sql, params),
+    run: (sql, params) => {
+      runLog?.push({ sql, params: params ?? [] });
+      return inner.run(sql, params);
+    },
     get: (sql, params) => {
       log.push({ sql, params: params ?? [] });
       return inner.get(sql, params);
@@ -100,7 +103,8 @@ function capture(store: Store, log: Captured[], fn: () => unknown): Captured[] {
 describe("sq_log per-topic hot-path query plans", () => {
   const inner = memoryHandle();
   const log: Captured[] = [];
-  const store = new Store(recordingHandle(inner, log));
+  const runLog: Captured[] = [];
+  const store = new Store(recordingHandle(inner, log, runLog));
   store.init("normal");
   seed(store);
   seedKeyed(store);
@@ -162,6 +166,51 @@ describe("sq_log per-topic hot-path query plans", () => {
         }
       });
     }
+
+    // Acknowledged retention (host-guide §4.8): the prefix walk and the head
+    // probes stay on the UNIQUE(topic, writer, seq) key; the ack/floor tables
+    // are read by their primary keys — none sorts, none scans.
+    const retentionPaths: [string, RegExp, () => unknown][] = [
+      ["streamHead", /sqlite_autoindex_sq_log_1/, () => store.streamHead("mesh.m.events", "w1", 64)],
+      ["chainAt", /sqlite_autoindex_sq_log_1/, () => store.chainAt("mesh.m.events", "w1", 10)],
+      ["hlcLAt", /sqlite_autoindex_sq_log_1/, () => store.hlcLAt("mesh.m.events", "w1", 10)],
+      ["acksForTopic", /sqlite_autoindex_sq_acks_1/, () => store.acksForTopic("mesh.m.events")],
+      ["ackNodes", /sqlite_autoindex_sq_ack_nodes_1/, () => store.ackNodes("mesh.m.events")],
+      ["floorGet", /sqlite_autoindex_sq_floors_1/, () => store.floorGet("mesh.m.events", "w1")],
+      ["floorsForTopic", /sqlite_autoindex_sq_floors_1/, () => store.floorsForTopic("mesh.m.events")],
+    ];
+    for (const [name, index, fn] of retentionPaths) {
+      it(`${name} seeks ${index.source} with no TEMP B-TREE and no table scan (${variant})`, () => {
+        prepare();
+        const queries = capture(store, log, fn);
+        expect(queries.length).toBeGreaterThan(0);
+        for (const q of queries) {
+          const plan = planOf(inner, q);
+          expect(plan, q.sql).not.toMatch(/TEMP B-TREE/);
+          expect(plan, q.sql).not.toMatch(/SCAN (sq_log|sq_acks|sq_ack_nodes|sq_floors)(?! USING)/);
+          expect(plan, q.sql).toMatch(index);
+        }
+      });
+    }
+
+    // The DELETEs pruneAcked / floor adoption issue go through run(), which
+    // the handle records separately. Captured from a throwaway topic so the
+    // seeded rows the other plans read stay put; every one is a key-range
+    // delete (no SCAN of any table).
+    it(`retention DELETEs are key-range deletes (${variant})`, () => {
+      prepare();
+      const start = runLog.length;
+      store.deleteStreamPrefix("mesh.none.events", "w1", 5);
+      store.deletePendingUpTo("mesh.none.events", "w1", 5);
+      store.ackForget("mesh.none.events", "n1");
+      const deletes = runLog.slice(start).filter((q) => q.sql.startsWith("DELETE"));
+      expect(deletes).toHaveLength(5);
+      for (const q of deletes) {
+        const plan = planOf(inner, q);
+        expect(plan, q.sql).not.toMatch(/SCAN/);
+        expect(plan, q.sql).toMatch(/USING (COVERING )?INDEX sqlite_autoindex_sq_/);
+      }
+    });
 
     it(`entriesAfterOrder walks sq_log_order with no TEMP B-TREE (${variant})`, () => {
       prepare();

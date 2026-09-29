@@ -61,6 +61,15 @@ CREATE TABLE IF NOT EXISTS sq_finality   (topic TEXT PRIMARY KEY, cert TEXT NOT 
 CREATE TABLE IF NOT EXISTS sq_directives (topic TEXT, writer TEXT, rgen INTEGER, directive TEXT NOT NULL,
   PRIMARY KEY (topic, writer, rgen));
 CREATE TABLE IF NOT EXISTS sq_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sq_acks (
+  topic TEXT NOT NULL, node TEXT NOT NULL, writer TEXT NOT NULL, seq INTEGER NOT NULL,
+  PRIMARY KEY (topic, node, writer));
+CREATE TABLE IF NOT EXISTS sq_ack_nodes (
+  topic TEXT NOT NULL, node TEXT NOT NULL, first_at INTEGER NOT NULL, seen_at INTEGER, proto INTEGER,
+  PRIMARY KEY (topic, node));
+CREATE TABLE IF NOT EXISTS sq_floors (
+  topic TEXT NOT NULL, writer TEXT NOT NULL, seq INTEGER NOT NULL, chain TEXT NOT NULL, at INTEGER NOT NULL,
+  PRIMARY KEY (topic, writer));
 CREATE TABLE IF NOT EXISTS sq_archive (
   topic TEXT NOT NULL, writer TEXT NOT NULL, seq INTEGER NOT NULL,
   entry TEXT NOT NULL, archived_at TEXT NOT NULL,
@@ -610,6 +619,130 @@ export class Store {
     }
     if (total > 0) this.logCounts.delete(topic); // recount lazily
     return total;
+  }
+
+  // ---- acknowledged retention (host-guide §4.8) ----
+  //
+  // sq_acks / sq_ack_nodes: what each peer NODE (its HELLO writer id) last
+  // advertised holding per stream of a full-sync topic, from its own HAVE —
+  // tiny tables (nodes × writers per topic), every access a PK seek or a PK
+  // prefix range. sq_floors: this node's per-stream retention floor — rows
+  // with seq ≤ floor are not held here and are never served (a WANT below it
+  // gets TRUNCATED). Monotone: floorSet never lowers a floor.
+
+  ackUpsert(topic: Topic, node: WriterId, writer: WriterId, seq: Seq): void {
+    this.db.run(
+      `INSERT INTO sq_acks (topic, node, writer, seq) VALUES (?, ?, ?, ?)
+       ON CONFLICT (topic, node, writer) DO UPDATE SET seq = excluded.seq`,
+      [topic, node, writer, seq],
+    );
+  }
+
+  // Observed liveness: first_at is set once (insert), seen_at/proto refresh.
+  ackNodeSeen(topic: Topic, node: WriterId, at: number, proto: number | null): void {
+    this.db.run(
+      `INSERT INTO sq_ack_nodes (topic, node, first_at, seen_at, proto) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (topic, node) DO UPDATE SET seen_at = excluded.seen_at,
+         proto = COALESCE(excluded.proto, sq_ack_nodes.proto)`,
+      [topic, node, at, at, proto],
+    );
+  }
+
+  // A host-named member never observed yet: start its max-lag clock (no-op if known).
+  ackNodeName(topic: Topic, node: WriterId, at: number): void {
+    this.db.run(
+      "INSERT OR IGNORE INTO sq_ack_nodes (topic, node, first_at, seen_at, proto) VALUES (?, ?, ?, NULL, NULL)",
+      [topic, node, at],
+    );
+  }
+
+  ackNodes(topic: Topic): { node: WriterId; firstAt: number; seenAt: number | null; proto: number | null }[] {
+    return this.db
+      .all<{ node: string; first_at: number; seen_at: number | null; proto: number | null }>(
+        "SELECT node, first_at, seen_at, proto FROM sq_ack_nodes WHERE topic = ?",
+        [topic],
+      )
+      .map((r) => ({ node: r.node, firstAt: r.first_at, seenAt: r.seen_at, proto: r.proto }));
+  }
+
+  acksForTopic(topic: Topic): { node: WriterId; writer: WriterId; seq: Seq }[] {
+    return this.db.all<{ node: string; writer: string; seq: number }>(
+      "SELECT node, writer, seq FROM sq_acks WHERE topic = ?",
+      [topic],
+    );
+  }
+
+  ackForget(topic: Topic, node: WriterId): void {
+    this.db.run("DELETE FROM sq_acks WHERE topic = ? AND node = ?", [topic, node]);
+    this.db.run("DELETE FROM sq_ack_nodes WHERE topic = ? AND node = ?", [topic, node]);
+  }
+
+  floorGet(topic: Topic, writer: WriterId): { seq: Seq; chain: string } | undefined {
+    return this.db.get<{ seq: number; chain: string }>(
+      "SELECT seq, chain FROM sq_floors WHERE topic = ? AND writer = ?",
+      [topic, writer],
+    );
+  }
+
+  floorSet(topic: Topic, writer: WriterId, seq: Seq, chain: string, at: number): void {
+    this.db.run(
+      `INSERT INTO sq_floors (topic, writer, seq, chain, at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (topic, writer) DO UPDATE SET seq = excluded.seq, chain = excluded.chain,
+         at = excluded.at WHERE excluded.seq > sq_floors.seq`,
+      [topic, writer, seq, chain, at],
+    );
+  }
+
+  floorsForTopic(topic: Topic): { writer: WriterId; seq: Seq; chain: string }[] {
+    return this.db.all<{ writer: string; seq: number; chain: string }>(
+      "SELECT writer, seq, chain FROM sq_floors WHERE topic = ?",
+      [topic],
+    );
+  }
+
+  // The oldest `limit` rows of one stream, seq order — pruneAcked's prefix
+  // walk. A range walk of the UNIQUE(topic, writer, seq) key; reads rowid and
+  // hlc_l only (both precede the payload column, so an overflowing payload's
+  // pages are never touched).
+  streamHead(topic: Topic, writer: WriterId, limit: number): { rowid: number; seq: Seq; hlcL: number }[] {
+    return this.db
+      .all<{ rowid: number; seq: number; hlc_l: number }>(
+        "SELECT rowid, seq, hlc_l FROM sq_log WHERE topic = ? AND writer = ? ORDER BY seq LIMIT ?",
+        [topic, writer, limit],
+      )
+      .map((r) => ({ rowid: r.rowid, seq: r.seq, hlcL: r.hlc_l }));
+  }
+
+  chainAt(topic: Topic, writer: WriterId, seq: Seq): string | undefined {
+    return this.db.get<{ chain: string }>(
+      "SELECT chain FROM sq_log WHERE topic = ? AND writer = ? AND seq = ?",
+      [topic, writer, seq],
+    )?.chain;
+  }
+
+  hlcLAt(topic: Topic, writer: WriterId, seq: Seq): number | undefined {
+    return this.db.get<{ hlc_l: number }>(
+      "SELECT hlc_l FROM sq_log WHERE topic = ? AND writer = ? AND seq = ?",
+      [topic, writer, seq],
+    )?.hlc_l;
+  }
+
+  // Delete one stream's rows with seq ≤ uptoSeq — the caller has just walked
+  // exactly that prefix inside the same transaction (so the DELETE is the
+  // walked, bounded row set), plus the local judgments hanging off it.
+  deleteStreamPrefix(topic: Topic, writer: WriterId, uptoSeq: Seq): void {
+    this.db.run("DELETE FROM sq_log WHERE topic = ? AND writer = ? AND seq <= ?", [topic, writer, uptoSeq]);
+    this.db.run("DELETE FROM sq_annotations WHERE topic = ? AND writer = ? AND seq <= ?", [
+      topic,
+      writer,
+      uptoSeq,
+    ]);
+    this.logCounts.delete(topic); // recount lazily
+  }
+
+  // Out-of-order entries at or below an adopted floor can never drain.
+  deletePendingUpTo(topic: Topic, writer: WriterId, uptoSeq: Seq): void {
+    this.db.run("DELETE FROM sq_pending WHERE topic = ? AND writer = ? AND seq <= ?", [topic, writer, uptoSeq]);
   }
 
   checkpointPut(

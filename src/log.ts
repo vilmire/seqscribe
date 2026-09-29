@@ -7,6 +7,18 @@ import { validateEntry } from "./codec.js";
 import { assertJsonValue, chainOf, seedOf } from "./encoding.js";
 import { misuse, SeqscribeError } from "./errors.js";
 import { hlcCompare, isOverEpsilon, merge, orderCompare, orderOf, stamp, type HlcState } from "./hlc.js";
+import {
+  ACKED_PRUNE_DEFAULT_MAX_ROWS,
+  ACKED_PRUNE_MAX_ROWS_CAP,
+  ackFloors,
+  ackedRetentionRefusal,
+  planMembers,
+  type AckedPruneOptions,
+  type AckedPruneResult,
+  type AckedPruneWriter,
+  type RetentionStats,
+  type StreamView,
+} from "./retention.js";
 import type { Store, WriterRow } from "./store.js";
 import { FULL_TAIL_DEFAULT } from "./subs.js";
 import type { TopicRegistry } from "./topics.js";
@@ -140,8 +152,37 @@ export const PRUNE_SUPERSEDED_MAX_ROWS_CAP = 10_000;
 // build a SNAP body: each store call stays LIMIT-bounded.
 const KEYED_READ_PAGE = 500;
 
+// Acknowledged retention (host-guide §4.8). Serialized through the queue so
+// the floor plan, the prefix walk and the DELETEs see one consistent state,
+// and an append or wire apply racing in the same batch is ordered against
+// them (the walked prefix is always far below any in-flight seq, but the
+// ordering makes that a property rather than an argument).
+interface PruneAckedItem {
+  t: "pruneAcked";
+  topic: Topic;
+  o: AckedPruneOptions;
+  maxRows: number;
+  resolve: (r: AckedPruneResult) => void;
+  reject: (e: unknown) => void;
+}
+
+// Floor adoption: advance a stream past a peer's retention floor (TRUNCATED)
+// or an export's declared floor. Mutates sq_writers like processAdopt, so it
+// is a queue item too.
+interface AdoptFloorItem {
+  t: "adoptFloor";
+  topic: Topic;
+  writer: WriterId;
+  seq: Seq;
+  chain: string;
+  resolve: (r: "adopted" | "noop" | "refused") => void;
+  reject: (e: unknown) => void;
+}
+
 type QueueItem =
   | AppendItem
+  | PruneAckedItem
+  | AdoptFloorItem
   | ExternalItem
   | SealItem
   | CertItem
@@ -166,6 +207,7 @@ export interface LogCoreOpts {
   timers: Timers;
   constants: Constants;
   emitAnomaly: (a: Anomaly) => void;
+  retention?: RetentionStats;
 }
 
 export type AppliedHook = (e: LogEntry, rowid: number | null, via: string | undefined) => void;
@@ -192,6 +234,10 @@ export class LogCore {
   private hlcState: HlcState;
   private readonly heads = new Map<string, WriterRow>();
   private readonly certs = new Map<Topic, FinalityCert | null>();
+  // retention floors (host-guide §4.8), store-backed and reloaded lazily like
+  // heads — `null` caches "no floor" so serveWant's check is a Map hit
+  private readonly floors = new Map<string, { seq: Seq; chain: string } | null>();
+  private readonly retention: RetentionStats | undefined;
   // incrementally maintained HAVE vectors — a fleet at the envelope has
   // thousands of topics, and rebuilding O(total streams) per HAVE_GET per peer
   // is the scan this cache removes. Expired tombstones may linger in the cache
@@ -219,6 +265,7 @@ export class LogCore {
     this.timers = opts.timers;
     this.constants = opts.constants;
     this.emitAnomaly = opts.emitAnomaly;
+    this.retention = opts.retention;
     const saved = this.store.metaGet(HLC_META_KEY);
     // Restoring the persisted HLC state keeps own-stream HLC monotonicity across
     // restarts even when the wall clock rewound (§1 per-writer monotonicity).
@@ -445,6 +492,58 @@ export class LogCore {
         reject,
       });
     });
+  }
+
+  // Acknowledged retention (host-guide §4.8): delete, per stream of a
+  // full-sync append topic, the oldest rows that every included member has
+  // acknowledged holding AND that are older than olderThanMs AND that every
+  // registered onEntry consumer has read — then record the new floor, so a
+  // WANT below it is answered with TRUNCATED instead of a silent gap. Never
+  // touches a fork-sealed or recovering stream; keeps a live stream's head
+  // row (its HLC-monotonicity and PROBE anchor). At most maxRows per call.
+  pruneAcked(topic: Topic, o: AckedPruneOptions): Promise<AckedPruneResult> {
+    try {
+      if (this.closed) throw new SeqscribeError("ERR_MISUSE", "node is closed");
+      this.topics.get(topic); // ERR_UNKNOWN_TOPIC before enqueue
+      const refusal = ackedRetentionRefusal(this.topics, topic);
+      if (refusal !== null) throw misuse(`pruneAcked: ${refusal}`);
+      if (!Number.isFinite(o?.olderThanMs) || o.olderThanMs < 0)
+        throw misuse("pruneAcked: olderThanMs must be a non-negative number");
+      if (!Number.isFinite(o.maxLagMs) || o.maxLagMs < 0)
+        throw misuse("pruneAcked: maxLagMs must be a non-negative number");
+      if (o.maxRows !== undefined && (!Number.isSafeInteger(o.maxRows) || o.maxRows < 1))
+        throw misuse("pruneAcked: maxRows must be a positive safe integer");
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    return new Promise((resolve, reject) => {
+      this.push({
+        t: "pruneAcked",
+        topic,
+        o,
+        maxRows: Math.min(o.maxRows ?? ACKED_PRUNE_DEFAULT_MAX_ROWS, ACKED_PRUNE_MAX_ROWS_CAP),
+        resolve,
+        reject,
+      });
+    });
+  }
+
+  adoptFloor(topic: Topic, writer: WriterId, seq: Seq, chain: string): Promise<"adopted" | "noop" | "refused"> {
+    if (this.closed) return Promise.reject(new SeqscribeError("ERR_MISUSE", "node is closed"));
+    return new Promise((resolve, reject) => {
+      this.push({ t: "adoptFloor", topic, writer, seq, chain, resolve, reject });
+    });
+  }
+
+  // This node's retention floor for a stream (rows ≤ seq are not held), or null.
+  floorOf(topic: Topic, writer: WriterId): { seq: Seq; chain: string } | null {
+    const k = `${topic}\u0000${writer}`;
+    let f = this.floors.get(k);
+    if (f === undefined) {
+      f = this.store.floorGet(topic, writer) ?? null;
+      this.floors.set(k, f);
+    }
+    return f;
   }
 
   // ---- keyed-append reads (host-guide §4.7) ----
@@ -718,6 +817,8 @@ export class LogCore {
           else if (item.t === "adopt") this.processAdopt(item, settle);
           else if (item.t === "retireTopic") this.processRetireTopic(item, settle);
           else if (item.t === "pruneTopic") this.processPruneTopic(item, settle);
+          else if (item.t === "pruneAcked") this.processPruneAcked(item, settle);
+          else if (item.t === "adoptFloor") this.processAdoptFloor(item, settle, applied, anomalies);
           else this.processPruneSuperseded(item, settle);
         }
         this.store.metaSet(HLC_META_KEY, JSON.stringify(this.hlcState));
@@ -730,6 +831,7 @@ export class LogCore {
       // a self-referential causal edge, §11.2).
       this.heads.clear();
       this.certs.clear();
+      this.floors.clear();
       this.vectorsCache = null;
       this.hlcState = hlcBefore;
       this.recoveries.clear();
@@ -1131,6 +1233,150 @@ export class LogCore {
     // Only sq_log rows move — stream heads (contig/chain) and hence vectors()
     // are untouched, exactly as for pruneTopic.
     settle.push(() => item.resolve({ prunedRows: pruned }));
+  }
+
+  // pruneAcked's flush-handler half — see pruneAcked(). Per stream (writer
+  // order, for determinism) a deletable prefix is walked from the stream's
+  // oldest held row and stops at the first row that is above the stream's
+  // target (min(ack floor, head − 1) — or finalSeq for a retired stream), not
+  // older than the age cutoff, or above the onEntry cursor floor. Rows below
+  // an existing floor (a bootstrapped node's leftover local history) are
+  // ordinary candidates. The walk reads rowid/seq/hlc_l only; the chain of
+  // the last deleted row becomes the new floor chain.
+  private processPruneAcked(item: PruneAckedItem, settle: (() => void)[]): void {
+    const { topic, o } = item;
+    const refusal = ackedRetentionRefusal(this.topics, topic);
+    if (refusal !== null) {
+      settle.push(() => item.reject(misuse(`pruneAcked: ${refusal}`)));
+      return;
+    }
+    const now = this.clock();
+    const streams: StreamView[] = this.store
+      .listWriters(topic)
+      .map((w) => this.getStream(topic, w.writer))
+      .sort((a, b) => (a.writer < b.writer ? -1 : a.writer > b.writer ? 1 : 0))
+      .map((h) => ({
+        writer: h.writer,
+        contigSeq: h.contigSeq,
+        sealReason: h.sealReason,
+        finalSeq: h.finalSeq,
+        recovering: this.recoveries.has(`${topic} ${h.writer}`),
+      }));
+    const plan = planMembers(this.store, topic, o, streams, this.writerId, now);
+    const floors = ackFloors(this.store, topic, streams, plan.included);
+    let cursorFloor = Number.MAX_SAFE_INTEGER;
+    for (const c of this.store.cursorsForTopic(topic)) cursorFloor = Math.min(cursorFloor, c.lastRowid);
+    const cutoff = now - o.olderThanMs;
+
+    let budget = item.maxRows;
+    let pruned = 0;
+    let more = false;
+    const writers: Record<WriterId, AckedPruneWriter> = {};
+    for (const s of streams) {
+      const prev = this.floorOf(topic, s.writer);
+      const af = floors.get(s.writer)!;
+      const report: AckedPruneWriter = { floor: prev?.seq ?? 0, ackFloor: af.ackFloor, pinnedBy: af.pinnedBy };
+      writers[s.writer] = report;
+      if (s.sealReason === "fork") {
+        report.skipped = "forked"; // §12 adjudication may need every row
+        continue;
+      }
+      if (s.recovering) {
+        report.skipped = "recovering";
+        continue;
+      }
+      if (budget <= 0) {
+        more = true;
+        continue;
+      }
+      const headCap = s.sealReason === "retired" ? (s.finalSeq ?? s.contigSeq) : s.contigSeq - 1;
+      const target = Math.max(Math.min(af.ackFloor, headCap), prev?.seq ?? 0);
+      const rows = this.store.streamHead(topic, s.writer, budget + 1);
+      let n = 0;
+      let lastSeq = 0;
+      for (const r of rows) {
+        if (r.seq > target || r.hlcL >= cutoff || r.rowid > cursorFloor || n === budget) break;
+        n++;
+        lastSeq = r.seq;
+      }
+      if (n === budget && rows.length > n) {
+        const next = rows[n]!;
+        if (next.seq <= target && next.hlcL < cutoff && next.rowid <= cursorFloor) more = true;
+      }
+      if (n === 0) continue;
+      budget -= n;
+      pruned += n;
+      if (o.dryRun) {
+        report.floor = Math.max(report.floor, lastSeq);
+        continue;
+      }
+      if (lastSeq > (prev?.seq ?? 0)) {
+        const chain = this.store.chainAt(topic, s.writer, lastSeq)!;
+        this.store.floorSet(topic, s.writer, lastSeq, chain, now);
+        this.floors.set(`${topic}\u0000${s.writer}`, { seq: lastSeq, chain });
+        report.floor = lastSeq;
+      }
+      this.store.deleteStreamPrefix(topic, s.writer, lastSeq);
+    }
+    if (!o.dryRun) {
+      for (const node of plan.forget) this.store.ackForget(topic, node);
+      if (pruned > 0) this.retention?.bump(topic, "prunedRows", pruned);
+    }
+    // Only sq_log rows and floors move; stream heads (contig/chain) and hence
+    // vectors() are untouched, exactly as for pruneTopic.
+    const result: AckedPruneResult = { prunedRows: pruned, more, writers, members: plan.members };
+    settle.push(() => item.resolve(result));
+  }
+
+  // Floor adoption (TRUNCATED / import). The stream head jumps to the floor
+  // and chains continue from its chain — rows at or below it are never
+  // delivered here. Refused on a fork-sealed stream (only a §13 directive
+  // resolves a fork) and on a floor that contradicts a recovery target.
+  private processAdoptFloor(
+    item: AdoptFloorItem,
+    settle: (() => void)[],
+    applied: { entry: LogEntry; rowid: number | null; via: string | undefined }[],
+    anomalies: Anomaly[],
+  ): void {
+    const { topic, writer, seq, chain } = item;
+    const done = (r: "adopted" | "noop" | "refused") => settle.push(() => item.resolve(r));
+    if (ackedRetentionRefusal(this.topics, topic) !== null) {
+      done("refused");
+      return;
+    }
+    const head = this.getStream(topic, writer);
+    if (head.contigSeq >= seq) {
+      done("noop");
+      return;
+    }
+    const target = this.recoveries.get(`${topic} ${writer}`);
+    if (head.sealReason !== null && !target) {
+      done("refused");
+      return;
+    }
+    if (target && (seq > target.finalSeq || (seq === target.finalSeq && chain !== target.finalChain))) {
+      done("refused");
+      return;
+    }
+    head.contigSeq = seq;
+    head.contigChain = chain;
+    const now = new Date(this.clock()).toISOString();
+    if (target && seq === target.finalSeq) {
+      head.sealReason = "retired";
+      head.rgen = target.rgen;
+      head.retiredAt = now;
+      head.finalSeq = target.finalSeq;
+      head.finalChain = target.finalChain;
+      this.recoveries.delete(`${topic} ${writer}`);
+    }
+    this.saveHead(head);
+    this.store.floorSet(topic, writer, seq, chain, this.clock());
+    this.floors.delete(`${topic}\u0000${writer}`);
+    this.store.deletePendingUpTo(topic, writer, seq);
+    anomalies.push({ kind: "floor_adopted", topic, writer });
+    this.retention?.bump(topic, "floorsAdopted");
+    if (head.sealReason === null) this.drainPending(head, applied, anomalies, undefined);
+    done("adopted");
   }
 
   private recoveryIngest(

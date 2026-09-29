@@ -137,7 +137,7 @@ Verified at contiguous apply against the previous verified chain; mismatch = for
 **Over-credit receiver remedy (v3.5, P6).** Because a conforming sender keeps unACKed frames ≤ `INFLIGHT_CREDITS` and ACK advances only to the contiguous mid, every legitimate data frame satisfies `mid ≤ recvContigMid + INFLIGHT_CREDITS`. A frame beyond that window is **not congestion — it is a protocol violation**, and unbounded tolerance means unbounded receive-buffer growth. A receiver **MUST** respond to `mid > recvContigMid + INFLIGHT_CREDITS` by sending ERR and closing the session (close reason `protocol`, §14). Mids, credits and subscriptions reset on redial, so a buggy-but-honest peer recovers on the next dial. **★v3.7 (P38) — the distinct code now lands, version-gated.** P6 proposed a distinct protocol-violation `ErrCode` and v3.5, v3.6 and v3.7-early all deferred it on the same reasoning: it puts a code on the wire that no existing peer's `ErrCode` union contains, and it should arrive "alongside a protocol-version bump that gives peers a negotiated way to know the code is available". **HELLO's `protoMin`/`protoMax` already was that mechanism** — it had simply never been used for anything, with both bounds pinned at 1. `PROTO_MAX` is now **2**, and the rule is: a receiver whose session negotiated **proto ≥ 2** MUST send `ERR_PROTOCOL` at the four protocol-violation closes (this credit-window bound and the three §5.4 chunked-reassembly overflows); a receiver that negotiated **proto 1** MUST send `ERR_ENTRY_ENCODING` at those same sites, which is what a proto-1 peer's union contains. A session that has not completed HELLO is treated as proto 1. Mixed-version fleets are therefore unaffected in either direction, and the code is a pure diagnostic refinement — **the remedy (ERR then close with reason `protocol`) is unchanged, and no peer's behavior depends on which code it receives**, since it is being closed on regardless.
 **v3.6 re-deferral rationale (superseded by P38 above; retained as the record of why it waited).** Adding `ERR_PROTOCOL` is a *wire* change: it puts a code on the ERR frame that no v3.5 peer's `ErrCode` union contains, at four close sites (the credit window here, and the three §5.4 reassembly-overflow sites). Since the frame is sent immediately before closing the session, and the receiving peer is being closed on anyway, the new code buys the receiver diagnostic precision it cannot act on — while costing every mixed-version fleet a frame its peers must be taught to parse. The value is real but small, the compatibility cost is fleet-wide, and nothing in the v3.6 cycle (a beacon-surface release) needs it. It should land alongside a protocol-version bump that gives peers a negotiated way to know the code is available, not as a silent widening of the union. Until then the remedy — ERR then close with reason `protocol` — is the normative part, and it is fully specified above without the code.
 
-**5.3 Control lane.** HELLO, HAVE_GET, HAVE, WANT, PROBE(_RES), FINALITY, WRITER_DIRECTIVE, SNAPSHOT_OFFER/GET, SUB, UNSUB, SUB_ERR, ACK, ERR — outside the mid space, **priority-queued ahead of the data lane and exempt from SEND_QUEUE_CAP** (they are small and bounded). Requests expecting responses (HELLO, HAVE_GET, WANT, PROBE, SNAPSHOT_GET, SUB) retry every `CONTROL_RETRY_MS` until satisfied or close; HELLO unanswered `HELLO_TIMEOUT_MS` → close.
+**5.3 Control lane.** HELLO, HAVE_GET, HAVE, WANT, PROBE(_RES), TRUNCATED (proto ≥ 3, §7.10), FINALITY, WRITER_DIRECTIVE, SNAPSHOT_OFFER/GET, SUB, UNSUB, SUB_ERR, ACK, ERR — outside the mid space, **priority-queued ahead of the data lane and exempt from SEND_QUEUE_CAP** (they are small and bounded). Requests expecting responses (HELLO, HAVE_GET, WANT, PROBE, SNAPSHOT_GET, SUB) retry every `CONTROL_RETRY_MS` until satisfied or close; HELLO unanswered `HELLO_TIMEOUT_MS` → close.
 
 **Reasoned session closure (v3.5, P10/P16).** Every session closure carries a **reason** — `hello_timeout` | `transport` | `protocol` | `stall` | `detach` | `node_closed` (§14 `SessionCloseReason`) — distinguishing a reachable endpoint that never speaks the protocol from transport loss, protocol violation, the §5.2 stall backstop, and host-initiated teardown. Without it, a misclassified endpoint is indistinguishable from a flapping link: both present as attach → close → redial forever. `hello_timeout` is the `HELLO_TIMEOUT_MS` expiry above; `protocol` covers version mismatch, the §5.2 credit-window remedy, and §5.4 reassembly overflow. The reason is delivered on the §14 lifecycle feed and queryable from the peer handle. Repeated consecutive `hello_timeout` closures against one peer are a host-actionable signal (§14 `manageReconnect`), not merely a retry condition.
 
@@ -205,6 +205,12 @@ Verified at contiguous apply against the previous verified chain; mismatch = for
 
 { t:"PROBE", topic, writer, seqs:Seq[] }
 { t:"PROBE_RES", topic, writer, points:{seq, chain}[], unavailable?:{belowSeq:Seq} }
+
+{ t:"TRUNCATED", req:number, topic, writer, floorSeq:Seq, floorChain:string }
+// ★proto ≥ 3 only (§7.10). The answer to a WANT with fromSeq ≤ the responder's retention
+// floor for the stream: rows 1..floorSeq are not served. Satisfies the WANT; the
+// requester MAY advance contig to floorSeq with floorChain and re-WANT above it. Never
+// sent to a session that negotiated proto < 3 (that WANT gets the empty `done` ENTRIES).
 
 { t:"FINALITY", topic, cert:FinalityCert }
 { t:"WRITER_DIRECTIVE", directive:WriterDirective }
@@ -355,6 +361,16 @@ interface SnapshotBody {
 **7.8 Bootstrap.** **Ordering rule: a node MUST NOT issue WANTs below a topic's cut before holding a verified certificate for it** (topics with no authority are exempt — they have no cut). The connect sequence is: HAVE exchange → fgen lag repair (FINALITY push) → then snapshot. Flow: WANT below the cut → SNAPSHOT_OFFER → SNAPSHOT_GET (wanted view versions) → SNAPSHOT (chunked; certHash verified) → ENTRIES replay from the cut (chains continue from cut chains); writer lifecycle restores from the snapshot's signature-verified directives (§7.7). A view absent at matching version: starts from init at the cut, flagged `bootstrapPartial`; the host MUST provision full state if completeness is required (a version bump with no pre-cut logs anywhere makes this permanent — host's responsibility).
 
 **7.9 Ring topics** are exempt from finality, archive, and snapshots.
+
+**7.10 Acknowledged retention (local extension, proto 3).** §7.6 compaction needs a topic authority; a full-sync topic without one otherwise grows forever, and a *local* delete (`pruneTopic`) is refused on it because a peer still missing the deleted range is left with a permanent gap. Acknowledged retention deletes only what every relevant peer has **acknowledged**, and gives a peer that is below the deletion floor anyway a defined way over it. It is local housekeeping — no signed artifact, no `topicSchemaHash` input, no policy field — plus one version-gated control message. Full design and host obligations: [docs/host-guide.md](docs/host-guide.md) §4.8.
+
+- **Eligible topics**: `kind:"append"`, `replication:"full-sync"`, `retention:"full"`, not keyed. Register topics replay from genesis (§11) and keyed state is newest-per-key over the whole topic (host-guide §4.7), so neither survives losing a prefix.
+- **Acknowledgment** = a peer node's own HAVE (§5.4) for a mutual-full topic: its committed contig per writer (`finalSeq` for a tombstone), recorded durably per `(topic, node, writer)` under the peer's HELLO `node`. No new message: a pre-proto-3 peer acknowledges identically. Hosts MAY add acknowledgments from another self-report of the same node (e.g. a §5.7 Beacon report) — only from a source trusted to drive deletion.
+- **Floor** per stream = min over *included members* of their acknowledgment (a member that never acknowledged the stream counts 0, except the stream's own author), capped at `contig − 1` for a live stream (the head row stays: HLC-monotonicity check and PROBE anchor) and at `finalSeq` for a retired one; rows are deleted only while also older than the host's retention window (`hlc.l < now − olderThanMs`) and at or below every registered `onEntry` cursor. **Fork-sealed and recovering streams are never pruned** (§12 may need every row). The deleted set is always a per-stream seq prefix; the node records `(floorSeq, floorChain)` = the last deleted row. Floors are monotone.
+- **Membership**: host-supplied, or by default every node that has acknowledged the topic here plus every non-retired writer of it. A member whose newest evidence (last acknowledgment, first naming, or its own newest entry held here) is older than `maxLagMs` **stops pinning** — it is then pruned past and recovers via TRUNCATED when it returns. A host-excluded member never pins, and its acknowledgment rows are forgotten.
+- **TRUNCATED**: a WANT with `fromSeq ≤ floorSeq` is answered (after the §7.8 snapshot path, which keeps precedence) with TRUNCATED on a proto ≥ 3 session. The requester accepts it only as the answer to its own active WANT, only for `fromSeq ≤ floorSeq ≤` the head that peer advertised, and never on a fork-sealed stream (a recovering stream accepts a floor ≤ its target `finalSeq`, retiring at equality with a matching chain). Adoption advances contig/chain to the floor, records the floor, drops `sq_pending` rows at or below it, drains the rest, and emits `floor_adopted`; views on the topic are flagged `bootstrapPartial` (§7.8). Trust is §4.1's: a full-sync peer is already trusted with the content itself.
+- **Mixed versions**: a proto < 3 requester below a floor gets the empty `done` ENTRIES it has always understood (plus `floor_unservable`, once per stream per session); §6.2b parks the stream until the next HAVE round, so there is no spin, and it stays behind on that stream until it upgrades or reaches a peer that still holds the range. Knowledge-based push (§6.3) never pushes rows above a floor to a peer below it — they could not drain. An old peer still acknowledges through HAVE, so while it is within `maxLagMs` nothing it lacks is deleted.
+- **Export** (§15) carries the floors in the header (`floors`, absent when none); an importer adopts them before applying rows.
 
 ## 8. Storage — SQLite DDL
 
@@ -1104,9 +1120,46 @@ The node-side hint callback rides an **extension overload** — `beacon(t, o?)` 
 
 **Beacon lifecycle errors (P28, §5.7c).** Starting an already-started beacon throws `ERR_MISUSE` ("beacon already started"), as before. Starting one whose node has closed also throws `ERR_MISUSE`, with a **distinct** message (reference implementation: "beacon closed — the node is closed") — distinct because a host must be able to tell "I re-armed too late in shutdown" from the generic node-closed error, and because a test that cannot tell them apart cannot pin that node-level teardown stayed terminal.
 
+### 14.3 Acknowledged retention surface (local extension, proto 3)
+
+§7.10's host surface. Normative in shape as §14.1: an implementation MAY omit it, but one that provides it MUST match these signatures and the §7.10 semantics.
+
+```ts
+interface AckedPruneOptions {
+  olderThanMs: number;          // retention window: only rows with hlc.l < now − olderThanMs go
+  maxLagMs: number;             // a member silent longer than this stops pinning
+  members?: WriterId[];         // default: every acknowledging node + every non-retired writer
+  excludeMembers?: WriterId[];  // removed nodes: never pin; their acknowledgments are forgotten
+  maxRows?: number;             // per-call bound (reference: default 1_000, clamp 10_000)
+  dryRun?: boolean;             // plan only — deletes and persists nothing
+}
+interface AckedPruneResult {
+  prunedRows: number;           // deleted (dryRun: deletable within the bound)
+  more: boolean;                // bound reached with deletable rows left — call again
+  writers: Record<WriterId, {floor: Seq, ackFloor: Seq, pinnedBy: WriterId | null,
+                             skipped?: "forked" | "recovering"}>;
+  members: {node: WriterId, lastSeenAt: number | null,
+            excluded: null | "lagging" | "excluded"}[];
+}
+interface AckedRetentionSurface {
+  // Rejects ERR_MISUSE on an ineligible topic (§7.10) or bad arguments. Serialized with
+  // appends and wire applies (it is an append-queue item, §8).
+  pruneAcked(topic: Topic, o: AckedPruneOptions): Promise<AckedPruneResult>;
+  retentionFloors(topic: Topic): Record<WriterId, Seq>;   // this node's per-stream floors
+  noteAcks(node: WriterId, vectors: HaveVectors, o?: {at?: number}): void;
+}
+interface MsgTruncated { t: "TRUNCATED"; req: number; topic: Topic; writer: WriterId;
+                         floorSeq: Seq; floorChain: string; }
+// Anomaly kinds added by this extension (the §14 union is extended, not replaced):
+//   "floor_adopted"    {topic, writer} — this node advanced a stream past a peer's floor
+//   "floor_unservable" {topic, writer, peerId} — a proto < 3 peer WANTed below our floor
+```
+
+Storage (§8 additions): `sq_acks(topic, node, writer, seq)` PK (topic, node, writer); `sq_ack_nodes(topic, node, first_at, seen_at, proto)` PK (topic, node); `sq_floors(topic, writer, seq, chain, at)` PK (topic, writer). All three are tiny (nodes × writers per topic) and read by primary key; the prefix walk rides `UNIQUE(topic, writer, seq)`.
+
 ## 15. Export / import
 
-JSONL; line 1 header `{"seqscribe":"export/v1", topic, base: "genesis" | {order, cut}}`. Partial exports chain from the declared cut base. Import is identity-preserving; **the provided `chain` is verified against recomputation** (never overwritten) — mismatch = fork path, and same-id-different-content likewise. contig and finality rules apply unchanged.
+JSONL; line 1 header `{"seqscribe":"export/v1", topic, base: "genesis" | {order, cut}, floors?}` — `floors` (§7.10) maps writer → `{seq, chain}`, absent when the exporter holds no retention floor; an importer adopts them first. Partial exports chain from the declared cut base. Import is identity-preserving; **the provided `chain` is verified against recomputation** (never overwritten) — mismatch = fork path, and same-id-different-content likewise. contig and finality rules apply unchanged.
 
 ## 16. Constants (defaults)
 
