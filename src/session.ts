@@ -122,6 +122,9 @@ export class Session {
   private readonly unacked: { mid: number; at: number; frame: string; sentAt: number }[] = [];
   private readonly outQueue: ((mid: number) => DataMsg)[] = [];
   private retryTimer: unknown = null;
+  // Clock of the last ACK that retired at least one frame. Stall detection counts
+  // an advancing ACK as progress (see stallCheck).
+  private lastAckProgressAt = 0;
   // data lane — receiver
   private recvContigMid = 0;
   private readonly recvBuffer = new Map<number, DataMsg>();
@@ -330,7 +333,16 @@ export class Session {
   private stallCheck(): void {
     if (this.stateNow === "closed") return;
     const oldest = this.unacked[0];
-    if (oldest && this.o.clock() - oldest.at > this.c.CHANNEL_STALL_MS) {
+    // `oldest.at` is when the frame was handed to the channel, NOT when the
+    // link started carrying it: INFLIGHT_CREDITS frames are written at once and a
+    // slow link (relay) delivers them one after another, so the k-th frame's ACK
+    // legitimately arrives ~k frame-transmit-times later. Judging by `at` alone
+    // killed a large, steadily progressing chunked SNAP as a "stall" and every
+    // reattach restarted it. A stall is unACKed data with NO ACK progress for
+    // CHANNEL_STALL_MS: measure from the later of the frame's send and the last
+    // ACK that advanced.
+    const sinceProgress = Math.max(oldest ? oldest.at : 0, this.lastAckProgressAt);
+    if (oldest && this.o.clock() - sinceProgress > this.c.CHANNEL_STALL_MS) {
       this.close("stall");
       return;
     }
@@ -443,6 +455,7 @@ export class Session {
       let i = 0;
       while (i < this.unacked.length && this.unacked[i]!.mid <= m.upTo) i++;
       this.unacked.splice(0, i);
+      if (i > 0) this.lastAckProgressAt = this.o.clock();
       this.pumpData();
       if (this.hasSendCapacity()) this.o.onCapacity?.(this);
       return;
